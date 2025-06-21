@@ -3,7 +3,6 @@
 
 const express = require('express');
 const { WebSocketServer } = require('ws');
-const crypto = require('crypto');
 const fs = require('fs');
 const WebSocket = require('ws');
 
@@ -16,7 +15,7 @@ const NETWORK_CONFIG = {
   // Tetrahedral topology (each node connects to 3 others)
   topology: 'tetrahedral',
   nodeId: process.env.NODE_ID || `node-${Date.now().toString(36)}-${Math.random().toString(36).substr(2, 5)}`,
-  
+
   // Node roles based on golden ratio distribution
   roles: {
     master: 1,      // 1/6 - Main coordinator
@@ -67,7 +66,7 @@ class DistributedStorage {
     this.replicatedData = new Map();
     this.metadata = new Map();
     this.peers = new Map();
-    
+
     // Node state
     this.state = {
       isLeader: false,
@@ -97,16 +96,16 @@ class DistributedStorage {
 
   async initializeNode() {
     console.log(`🌊 Node ${this.nodeId} starting as ${this.role}`);
-    
+
     // Connect to peer network
     this.connectToPeers();
-    
+
     // Start consensus protocol
     this.startConsensusLoop();
-    
+
     // Begin anti-sleep mechanism
     this.startKeepAlive();
-    
+
     // Initialize role-specific services
     this.initializeRoleServices();
   }
@@ -114,10 +113,10 @@ class DistributedStorage {
   async connectToPeers() {
     for (const peerUrl of NETWORK_CONFIG.peers) {
       if (!peerUrl || peerUrl.includes(this.nodeId)) continue;
-      
+
       try {
         const ws = new WebSocket(peerUrl.replace('https://', 'wss://'));
-        
+
         ws.on('open', () => {
           console.log(`🤝 Connected to peer: ${peerUrl}`);
           this.peers.set(peerUrl, {
@@ -125,7 +124,7 @@ class DistributedStorage {
             lastSeen: Date.now(),
             health: 'connected'
           });
-          
+
           // Send introduction
           this.sendToPeer(ws, {
             type: 'node_intro',
@@ -137,7 +136,7 @@ class DistributedStorage {
 
         ws.on('message', (data) => this.handlePeerMessage(peerUrl, data));
         ws.on('close', () => this.handlePeerDisconnect(peerUrl));
-        
+
       } catch (error) {
         console.log(`❌ Failed to connect to ${peerUrl}:`, error.message);
       }
@@ -168,7 +167,7 @@ class DistributedStorage {
 
         // Ping all peers to keep network alive
         this.pingAllPeers();
-        
+
       } catch (error) {
         console.log('⚠️ Keep-alive error:', error.message);
       }
@@ -196,7 +195,7 @@ class DistributedStorage {
 
   async performConsensusRound() {
     const activePeers = this.getActivePeers();
-    
+
     if (activePeers.length < NETWORK_CONFIG.consensus.quorum - 1) {
       console.log(`⚠️ Insufficient peers for consensus: ${activePeers.length}`);
       return;
@@ -217,14 +216,14 @@ class DistributedStorage {
 
   electLeader() {
     const activePeers = this.getActivePeers();
-    
+
     // Use deterministic leader election based on node ID
     const candidates = [this.nodeId, ...activePeers.map(p => p.nodeId)].sort();
     const leader = candidates[0];
-    
+
     const wasLeader = this.state.isLeader;
     this.state.isLeader = (leader === this.nodeId);
-    
+
     if (this.state.isLeader && !wasLeader) {
       console.log(`👑 Node ${this.nodeId} became leader`);
       this.onBecomeLeader();
@@ -243,7 +242,7 @@ class DistributedStorage {
   async addEvent(event) {
     // Determine storage nodes for this event (golden ratio distribution)
     const storageNodes = this.selectStorageNodes(event.id);
-    
+
     // Store locally if this node is responsible
     if (storageNodes.includes(this.nodeId)) {
       this.localData.set(event.id, event);
@@ -272,7 +271,7 @@ class DistributedStorage {
     // Use consistent hashing with golden ratio distribution
     const hash = crypto.createHash('sha256').update(eventId).digest('hex');
     const hashValue = parseInt(hash.slice(0, 8), 16);
-    
+
     const allNodes = [this.nodeId, ...this.getActivePeers().map(p => p.nodeId)];
     const storageNodes = allNodes.filter(nodeId => {
       const nodeHash = crypto.createHash('sha256').update(nodeId + eventId).digest('hex');
@@ -306,7 +305,7 @@ class DistributedStorage {
   handlePeerMessage(peerUrl, data) {
     try {
       const message = JSON.parse(data);
-      
+
       switch (message.type) {
         case 'node_intro':
           this.handleNodeIntro(peerUrl, message);
@@ -365,7 +364,7 @@ class DistributedStorage {
 
   handlePeerDisconnect(peerUrl) {
     console.log(`💔 Peer disconnected: ${peerUrl}`);
-    
+
     const peer = this.peers.get(peerUrl);
     if (peer) {
       peer.health = 'disconnected';
@@ -382,10 +381,10 @@ class DistributedStorage {
 
   startMasterServices() {
     console.log('👑 Starting master node services');
-    
+
     // Global state management
     this.state.isLeader = true;
-    
+
     // Coordinate network health
     setInterval(() => {
       this.checkNetworkHealth();
@@ -394,10 +393,10 @@ class DistributedStorage {
 
   startStorageServices() {
     console.log('📦 Starting storage node services');
-    
+
     // Optimize for data persistence
     this.enableDataPersistence();
-    
+
     // Regular backup to peers
     setInterval(() => {
       this.backupDataToPeers();
@@ -406,10 +405,10 @@ class DistributedStorage {
 
   startCacheServices() {
     console.log('⚡ Starting cache node services');
-    
+
     // Optimize for fast queries
     this.buildSearchIndices();
-    
+
     // Cache popular content
     setInterval(() => {
       this.cachePopularContent();
@@ -418,10 +417,10 @@ class DistributedStorage {
 
   startGatewayServices() {
     console.log('🌐 Starting gateway node services');
-    
+
     // Handle client connections
     this.optimizeForConnections();
-    
+
     // Load balancing
     this.startLoadBalancing();
   }
@@ -451,11 +450,11 @@ class DistributedStorage {
   mergeResults(local, remote) {
     // Merge and deduplicate results
     const merged = new Map();
-    
+
     [...local, ...remote].forEach(event => {
       merged.set(event.id, event);
     });
-    
+
     return Array.from(merged.values());
   }
 
@@ -473,7 +472,7 @@ class DistributedStorage {
   checkNetworkHealth() {
     const activePeers = this.getActivePeers();
     console.log(`💓 Network health: ${activePeers.length}/${NETWORK_CONFIG.peers.length} nodes active`);
-    
+
     if (activePeers.length < NETWORK_CONFIG.consensus.quorum) {
       console.log('⚠️ Network partition detected - entering degraded mode');
       this.state.health = 'degraded';
@@ -483,7 +482,7 @@ class DistributedStorage {
   }
 
   // ============= MISSING METHODS (STUBS) =============
-  
+
   buildSearchIndices() {
     console.log('🔍 Building search indices for cache node');
     // TODO: Implement search indexing
@@ -512,6 +511,21 @@ class DistributedStorage {
   startLoadBalancing() {
     console.log('⚖️ Starting load balancing');
     // TODO: Implement load balancing
+  }
+
+  startDataSynchronization() {
+    console.log('🔄 Starting data synchronization');
+    // TODO: Implement data sync
+  }
+
+  startConflictResolution() {
+    console.log('⚖️ Starting conflict resolution');
+    // TODO: Implement conflict resolution
+  }
+
+  coordinateReplication() {
+    console.log('📡 Coordinating replication');
+    // TODO: Implement replication coordination
   }
 }
 
@@ -558,7 +572,7 @@ class DistributedAPI {
         };
 
         const events = await this.storage.queryEvents(filter);
-        
+
         res.json({
           items: events,
           node: this.storage.nodeId,
@@ -614,10 +628,10 @@ class DistributedAPI {
 
     // WebSocket server for real-time sync
     const wss = new WebSocketServer({ server });
-    
+
     wss.on('connection', (ws, req) => {
       console.log(`🔌 Client connected to ${this.storage.role} node`);
-      
+
       // Send node info to client
       ws.send(JSON.stringify({
         type: 'node_info',
@@ -635,16 +649,16 @@ class DistributedAPI {
 
 async function initializeDistributedNode() {
   console.log('🌊 Initializing distributed Nostr node...');
-  
+
   // Create storage layer
   const storage = new DistributedStorage(process.env.NODE_ID || `node-${Date.now().toString(36)}-${Math.random().toString(36).substr(2, 5)}`);
-  
+
   // Create API layer
   const api = new DistributedAPI(storage);
-  
+
   // Start server
   const server = api.start();
-  
+
   // Graceful shutdown
   process.on('SIGTERM', () => {
     console.log('🛑 Graceful shutdown initiated');
