@@ -14,7 +14,7 @@ const FIBONACCI = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55];
 const NETWORK_CONFIG = {
   // Tetrahedral topology (each node connects to 3 others)
   topology: 'tetrahedral',
-  nodeId: process.env.NODE_ID || crypto.randomBytes(4).toString('hex'),
+  nodeId: process.env.NODE_ID || `node-${Date.now().toString(36)}-${Math.random().toString(36).substr(2, 5)}`,
   
   // Node roles based on golden ratio distribution
   roles: {
