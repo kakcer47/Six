@@ -2,7 +2,6 @@
 // 6-node resilient network with tetrahedral stability
 
 const express = require('express');
-const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
 const fs = require('fs');
