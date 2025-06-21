@@ -636,7 +636,7 @@ async function initializeDistributedNode() {
   console.log('🌊 Initializing distributed Nostr node...');
   
   // Create storage layer
-  const storage = new DistributedStorage(process.env.NODE_ID || crypto.randomBytes(4).toString('hex'));
+  const storage = new DistributedStorage(process.env.NODE_ID || `node-${Date.now().toString(36)}-${Math.random().toString(36).substr(2, 5)}`);
   
   // Create API layer
   const api = new DistributedAPI(storage);
