@@ -2,6 +2,7 @@
 // 6-node resilient network with tetrahedral stability
 
 const express = require('express');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -605,7 +606,7 @@ async function initializeDistributedNode() {
   console.log('🌊 Initializing distributed Nostr node...');
   
   // Create storage layer
-  const storage = new DistributedStorage();
+  const storage = new DistributedStorage(process.env.NODE_ID || crypto.randomBytes(4).toString('hex'));
   
   // Create API layer
   const api = new DistributedAPI(storage);
