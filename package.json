@@ -2,10 +2,10 @@
   "name": "distributed-nostr-node",
   "version": "1.0.0",
   "description": "Distributed Nostr relay node for 6-node resilient network",
-  "main": "distributed-server.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node distributed-server.js",
-    "dev": "NODE_ENV=development node distributed-server.js",
+    "start": "server.js",
+    "dev": "NODE_ENV=development node server.js",
     "test": "echo \"Testing network health...\" && node test-health.js"
   },
   "engines": {
