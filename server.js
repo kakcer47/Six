@@ -481,6 +481,38 @@ class DistributedStorage {
       this.state.health = 'healthy';
     }
   }
+
+  // ============= MISSING METHODS (STUBS) =============
+  
+  buildSearchIndices() {
+    console.log('🔍 Building search indices for cache node');
+    // TODO: Implement search indexing
+  }
+
+  enableDataPersistence() {
+    console.log('💾 Enabling data persistence for storage node');
+    // TODO: Implement data persistence
+  }
+
+  backupDataToPeers() {
+    console.log('🔄 Backing up data to peers');
+    // TODO: Implement backup mechanism
+  }
+
+  cachePopularContent() {
+    console.log('⚡ Caching popular content');
+    // TODO: Implement content caching
+  }
+
+  optimizeForConnections() {
+    console.log('🌐 Optimizing for gateway connections');
+    // TODO: Implement connection optimization
+  }
+
+  startLoadBalancing() {
+    console.log('⚖️ Starting load balancing');
+    // TODO: Implement load balancing
+  }
 }
 
 // ========================= EXPRESS API LAYER =========================
