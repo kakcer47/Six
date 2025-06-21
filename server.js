@@ -3,6 +3,7 @@
 
 const express = require('express');
 const { WebSocketServer } = require('ws');
+const crypto = require('crypto');
 const fs = require('fs');
 const WebSocket = require('ws');
 
