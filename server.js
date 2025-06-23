@@ -24,11 +24,68 @@ app.use(cors())
 app.use(express.json())
 
 // SQLite Database
-const DB_PATH = ':memory:' // В памяти - не сохраняется на диск
+const DB_PATH = ':memory:' 
 let db = null
 
 // WebSocket clients
 const clients = new Set()
+
+app.get('/api/debug/sqlite', async (req, res) => {
+  try {
+    const events = await new Promise((resolve, reject) => {
+      db.all('SELECT * FROM events ORDER BY created_at DESC LIMIT 10', (err, rows) => {
+        if (err) reject(err)
+        else resolve(rows)
+      })
+    })
+    
+    res.json({
+      success: true,
+      eventsInSQLite: events.length,
+      events: events
+    })
+  } catch (error) {
+    res.json({
+      success: false,
+      error: error.message
+    })
+  }
+})
+
+// Debug endpoint - проверить WebSocket клиентов
+app.get('/api/debug/clients', (req, res) => {
+  const clientsInfo = Array.from(clients).map(ws => ({
+    id: ws.clientId,
+    readyState: ws.readyState,
+    readyStateText: ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState]
+  }))
+  
+  res.json({
+    totalClients: clients.size,
+    clients: clientsInfo
+  })
+})
+
+// Test broadcast
+app.post('/api/debug/test-broadcast', (req, res) => {
+  const testEvent = {
+    id: 'test-' + Date.now(),
+    title: 'Test Event',
+    description: 'This is a test event',
+    authorId: 'test',
+    author: { fullName: 'Test User' },
+    likes: 0,
+    createdAt: new Date().toISOString()
+  }
+  
+  broadcast('EVENT_CREATED', testEvent)
+  
+  res.json({
+    success: true,
+    message: 'Test broadcast sent',
+    clients: clients.size
+  })
+})
 
 // ===== SQLITE SETUP =====
 function initDatabase() {
@@ -137,6 +194,12 @@ function updateEvent(id, updates) {
     if (updates.category) {
       setParts.push('category = ?')
       values.push(updates.category)
+    }
+    
+    // ДОБАВЬ ЭТУ СТРОКУ:
+    if (updates.telegramMessageId) {
+      setParts.push('telegram_msg_id = ?')
+      values.push(updates.telegramMessageId)
     }
     
     setParts.push('updated_at = ?')
@@ -416,40 +479,76 @@ async function handleWebSocketMessage(message, senderWs) {
 }
 
 async function handleCreateEvent(data, senderWs) {
-  // Create event object
-  const event = {
-    id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-    title: data.title,
-    description: data.description,
-    authorId: data.authorId,
-    author: data.author,
-    city: data.city || '',
-    category: data.category || '',
-    gender: data.gender || '',
-    ageGroup: data.ageGroup || '',
-    likes: 0,
-    contacts: data.contacts || [],
-    status: 'active'
+  try {
+    // Create event object
+    const event = {
+      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      title: data.title,
+      description: data.description,
+      authorId: data.authorId,
+      author: data.author,
+      city: data.city || '',
+      category: data.category || '',
+      gender: data.gender || '',
+      ageGroup: data.ageGroup || '',
+      likes: 0,
+      contacts: data.contacts || [],
+      status: 'active'
+    }
+    
+    console.log('🔄 Creating event:', event.title)
+    
+    // 1. СНАЧАЛА сохраняем в SQLite
+    await insertEvent(event)
+    console.log('✅ Saved to SQLite')
+    
+    // 2. Отправляем в Telegram
+    const telegramMessage = formatEventForTelegram(event)
+    const sentMessage = await bot.sendMessage(GROUP_ID, telegramMessage, { parse_mode: 'HTML' })
+    event.telegramMessageId = sentMessage.message_id
+    console.log('✅ Sent to Telegram:', sentMessage.message_id)
+    
+    // 3. Обновляем telegramMessageId в SQLite
+    await updateEvent(event.id, { telegramMessageId: sentMessage.message_id })
+    
+    // 4. Broadcast to ALL clients (включая отправителя)
+    const frontendEvent = formatEventForFrontend({
+      id: event.id,
+      title: event.title,
+      description: event.description,
+      author_id: event.authorId,
+      author_name: event.author.fullName,
+      author_username: event.author.username,
+      author_avatar: event.author.avatar,
+      city: event.city,
+      category: event.category,
+      gender: event.gender,
+      age_group: event.ageGroup,
+      likes: event.likes,
+      created_at: Date.now(),
+      updated_at: Date.now(),
+      telegram_msg_id: sentMessage.message_id,
+      contacts: JSON.stringify(event.contacts),
+      status: event.status
+    })
+    
+    broadcast('EVENT_CREATED', frontendEvent) // БЕЗ excludeClient!
+    
+    // 5. Respond to sender
+    senderWs.send(JSON.stringify({
+      type: 'CREATE_EVENT_SUCCESS',
+      data: frontendEvent
+    }))
+    
+    console.log(`✅ Event created successfully: ${event.title}`)
+    
+  } catch (error) {
+    console.error('❌ Create event error:', error)
+    senderWs.send(JSON.stringify({
+      type: 'CREATE_EVENT_ERROR',
+      data: { message: 'Failed to create event: ' + error.message }
+    }))
   }
-  
-  // Send to Telegram first
-  const telegramMessage = formatEventForTelegram(event)
-  const sentMessage = await bot.sendMessage(GROUP_ID, telegramMessage, { parse_mode: 'HTML' })
-  event.telegramMessageId = sentMessage.message_id
-  
-  // Store in SQLite
-  await insertEvent(event)
-  
-  // Broadcast to clients
-  broadcast('EVENT_CREATED', event, senderWs)
-  
-  // Respond to sender
-  senderWs.send(JSON.stringify({
-    type: 'CREATE_EVENT_SUCCESS',
-    data: event
-  }))
-  
-  console.log(`✅ Created: ${event.title}`)
 }
 
 async function handleUpdateEvent(data, senderWs) {
