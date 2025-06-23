@@ -120,19 +120,40 @@ async function handleWebSocketMessage(message, senderWs) {
 async function handleCreateEvent(data, senderWs) {
   try {
     const event = {
-      id: Date.now().toString(),
-      ...data,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      likes: 0,
-      isLiked: false
+      t: "post",
+      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      title: data.title,
+      content: data.description,
+      author: {
+        id: data.authorId,
+        name: data.author.fullName,
+        photo: data.author.avatar,
+        username: data.author.username
+      },
+      meta: {
+        city: data.city || '',
+        tag: data.category || '',
+        gender: data.gender || '',
+        age: data.ageGroup || '',
+        date: new Date().toLocaleDateString('ru-RU', { 
+          day: '2-digit', 
+          month: '2-digit' 
+        })
+      },
+      ts: Date.now(),
+      stats: {
+        likes: 0,
+        views: 0,
+        last_updated: Date.now()
+      },
+      contacts: data.contacts,
+      status: 'active'
     }
 
     // Send to Telegram group
     const telegramMessage = formatEventForTelegram(event)
     await bot.sendMessage(GROUP_ID, telegramMessage, { parse_mode: 'HTML' })
 
-    // Broadcast to all WebSocket clients
     broadcast({
       type: 'EVENT_CREATED',
       data: event
@@ -144,6 +165,8 @@ async function handleCreateEvent(data, senderWs) {
       data: event
     }))
 
+    console.log(`✅ Event created and sent to Telegram: ${event.title}`)
+
   } catch (error) {
     console.error('Error creating event:', error)
     senderWs.send(JSON.stringify({
@@ -153,18 +176,20 @@ async function handleCreateEvent(data, senderWs) {
   }
 }
 
-// Update event handler
 async function handleUpdateEvent(data, senderWs) {
   try {
     const { id, ...updates } = data
     const event = {
       ...updates,
       id,
-      updatedAt: new Date().toISOString()
+      stats: {
+        ...updates.stats,
+        last_updated: Date.now()
+      }
     }
 
     // Send to Telegram group
-    const telegramMessage = `✏️ <b>Updated:</b>\n\n${formatEventForTelegram(event)}`
+    const telegramMessage = `✏️ <b>Обновлено:</b>\n\n${formatEventForTelegram(event)}`
     await bot.sendMessage(GROUP_ID, telegramMessage, { parse_mode: 'HTML' })
 
     // Broadcast to all WebSocket clients
@@ -184,6 +209,48 @@ async function handleUpdateEvent(data, senderWs) {
     senderWs.send(JSON.stringify({
       type: 'UPDATE_EVENT_ERROR',
       message: 'Failed to update event'
+    }))
+  }
+}
+
+// Like event handler
+async function handleLikeEvent(data, senderWs) {
+  try {
+    const { id, isLiked } = data
+    
+    // Увеличиваем/уменьшаем лайки
+    const newLikes = isLiked ? 1 : -1 // Simplified, в реальности нужна база данных
+    
+    const eventData = {
+      id,
+      isLiked,
+      likes: Math.max(0, newLikes), // Не даем уйти в минус
+      stats: {
+        last_updated: Date.now()
+      }
+    }
+
+    // Send to Telegram group
+    const action = isLiked ? 'лайкнул' : 'убрал лайк'
+    await bot.sendMessage(GROUP_ID, `⚡ Событие ${action}\n\n📊 ID: #${id}`, { parse_mode: 'HTML' })
+
+    // Broadcast to all WebSocket clients
+    broadcast({
+      type: 'EVENT_LIKED',
+      data: eventData
+    })
+
+    // Send success response
+    senderWs.send(JSON.stringify({
+      type: 'LIKE_EVENT_SUCCESS',
+      data: eventData
+    }))
+
+  } catch (error) {
+    console.error('Error liking event:', error)
+    senderWs.send(JSON.stringify({
+      type: 'LIKE_EVENT_ERROR',
+      message: 'Failed to like event'
     }))
   }
 }
@@ -278,20 +345,33 @@ function broadcast(data) {
   console.log(`📊 Broadcast result: ${successCount} success, ${errorCount} errors, ${clients.size} remaining`)
 }
 
-// Format event for Telegram
 function formatEventForTelegram(event) {
   let message = `🎯 <b>${event.title}</b>\n\n`
-  message += `${event.description}\n\n`
+  message += `${event.content}\n\n`
   
-  if (event.city) message += `📍 ${event.city}\n`
-  if (event.category) message += `🏷️ ${event.category}\n`
-  if (event.gender) message += `👤 ${event.gender}\n`
-  if (event.ageGroup) message += `🎂 ${event.ageGroup}\n`
+  const meta = []
+  if (event.meta.city) meta.push(`📍 ${event.meta.city}`)
+  if (event.meta.tag) meta.push(`🏷️ ${event.meta.tag}`)
+  if (event.meta.gender) meta.push(`👤 ${event.meta.gender}`)
+  if (event.meta.age) meta.push(`🎂 ${event.meta.age}`)
   
-  message += `\n👤 ${event.author.fullName}`
+  if (meta.length > 0) {
+    message += meta.join(' | ') + '\n\n'
+  }
+  
+  message += `👤 ${event.author.name}`
   if (event.author.username) {
     message += ` (@${event.author.username})`
   }
+  
+  if (event.contacts && event.contacts.length > 0) {
+    message += '\n\n📞 Контакты:\n'
+    event.contacts.forEach(contact => {
+      message += `• ${contact}\n`
+    })
+  }
+  
+  message += `\n📊 #${event.id}`
   
   return message
 }
