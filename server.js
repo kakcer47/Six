@@ -6,7 +6,7 @@ const cors = require('cors')
 const sqlite3 = require('sqlite3').verbose()
 const fs = require('fs')
 const path = require('path')
-
+const BOT2_URL = process.env.BOT2_URL || 'https://six-z05l.onrender.com'
 const app = express()
 const server = http.createServer(app)
 const wss = new WebSocket.Server({ server })
@@ -490,6 +490,39 @@ async function handleWebSocketMessage(message, senderWs) {
   }
 }
 
+async function sendCommandToBot2(type, eventId, data = {}) {
+  try {
+    console.log(`📤 Sending command to BOT2: ${type} for event ${eventId}`)
+    
+    const response = await fetch(`${BOT2_URL}/api/webhook/command`, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        'User-Agent': 'BOT1-Service'
+      },
+      body: JSON.stringify({
+        type,
+        eventId,
+        data,
+        timestamp: Date.now(),
+        source: 'BOT1'
+      }),
+      timeout: 5000
+    })
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`)
+    }
+    
+    const result = await response.json()
+    console.log(`✅ BOT2 response:`, result)
+    
+  } catch (error) {
+    console.error(`❌ Failed to send command to BOT2:`, error.message)
+    // НЕ блокируем основной процесс при ошибке
+  }
+}
+
 async function handleCreateEvent(data, senderWs) {
   try {
     // Create event object
@@ -510,20 +543,30 @@ async function handleCreateEvent(data, senderWs) {
     
     console.log('🔄 Creating event:', event.title)
     
-    // 1. СНАЧАЛА сохраняем в SQLite
+    // 1. Сохраняем в SQLite
     await insertEvent(event)
     console.log('✅ Saved to SQLite')
     
-    // 2. Отправляем в Telegram
+    // 2. Отправляем ТОЛЬКО событие в Telegram группу
     const telegramMessage = formatEventForTelegram(event)
     const sentMessage = await bot.sendMessage(GROUP_ID, telegramMessage, { parse_mode: 'HTML' })
     event.telegramMessageId = sentMessage.message_id
-    console.log('✅ Sent to Telegram:', sentMessage.message_id)
+    console.log('✅ Sent to Telegram group:', sentMessage.message_id)
     
     // 3. Обновляем telegramMessageId в SQLite
     await updateEvent(event.id, { telegramMessageId: sentMessage.message_id })
     
-    // 4. Broadcast to ALL clients (включая отправителя)
+    // 4. Уведомляем BOT2 о новом событии (вместо спама в группу)
+    await sendCommandToBot2('NEW_EVENT', event.id, {
+      event: {
+        ...event,
+        telegramMessageId: sentMessage.message_id,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      }
+    })
+    
+    // 5. Broadcast to WebSocket clients
     const frontendEvent = formatEventForFrontend({
       id: event.id,
       title: event.title,
@@ -544,9 +587,9 @@ async function handleCreateEvent(data, senderWs) {
       status: event.status
     })
     
-    broadcast('EVENT_CREATED', frontendEvent) // БЕЗ excludeClient!
+    broadcast('EVENT_CREATED', frontendEvent)
     
-    // 5. Respond to sender
+    // 6. Respond to sender
     senderWs.send(JSON.stringify({
       type: 'CREATE_EVENT_SUCCESS',
       data: frontendEvent
@@ -566,85 +609,133 @@ async function handleCreateEvent(data, senderWs) {
 async function handleUpdateEvent(data, senderWs) {
   const { id, ...updates } = data
   
-  // Update in SQLite
-  const updatedEvent = await updateEvent(id, updates)
-  
-  if (!updatedEvent) {
-    throw new Error('Event not found')
+  try {
+    // Update in SQLite
+    const updatedEvent = await updateEvent(id, updates)
+    
+    if (!updatedEvent) {
+      throw new Error('Event not found')
+    }
+    
+    // ❌ УБРАЛИ: Отправку в Telegram группу
+    // await bot.sendMessage(GROUP_ID, `✏️ <b>Обновлено:</b>\n\n${formatEventForTelegram(updatedEvent)}`, { parse_mode: 'HTML' })
+    
+    // ✅ ДОБАВИЛИ: Команду BOT2
+    await sendCommandToBot2('UPDATE_EVENT', id, {
+      updates,
+      updatedEvent
+    })
+    
+    // Broadcast to WebSocket clients
+    broadcast('EVENT_UPDATED', updatedEvent, senderWs)
+    
+    senderWs.send(JSON.stringify({
+      type: 'UPDATE_EVENT_SUCCESS',
+      data: updatedEvent
+    }))
+    
+    console.log(`✅ Updated: ${updatedEvent.title}`)
+    
+  } catch (error) {
+    console.error('❌ Update event error:', error)
+    senderWs.send(JSON.stringify({
+      type: 'UPDATE_EVENT_ERROR',
+      data: { message: 'Failed to update event: ' + error.message }
+    }))
   }
-  
-  // Send to Telegram
-  const telegramMessage = `✏️ <b>Обновлено:</b>\n\n${formatEventForTelegram(updatedEvent)}`
-  await bot.sendMessage(GROUP_ID, telegramMessage, { parse_mode: 'HTML' })
-  
-  // Broadcast to clients
-  broadcast('EVENT_UPDATED', updatedEvent, senderWs)
-  
-  senderWs.send(JSON.stringify({
-    type: 'UPDATE_EVENT_SUCCESS',
-    data: updatedEvent
-  }))
-  
-  console.log(`✅ Updated: ${updatedEvent.title}`)
 }
 
 async function handleDeleteEvent(data, senderWs) {
   const { id } = data
   
-  // Delete from SQLite
-  const result = await deleteEvent(id)
-  
-  if (!result.deleted) {
-    throw new Error('Event not found')
+  try {
+    // Get event before deletion (for BOT2)
+    const event = await getEventById(id)
+    
+    // Delete from SQLite
+    const result = await deleteEvent(id)
+    
+    if (!result.deleted) {
+      throw new Error('Event not found')
+    }
+    
+    // ❌ УБРАЛИ: Спам в группу
+    // await bot.sendMessage(GROUP_ID, `🗑️ <b>Удалено событие:</b>\n\n📊 #${id}`, { parse_mode: 'HTML' })
+    
+    // ✅ ДОБАВИЛИ: Команду BOT2
+    await sendCommandToBot2('DELETE_EVENT', id, {
+      deletedEvent: event
+    })
+    
+    // Broadcast to WebSocket clients
+    broadcast('EVENT_DELETED', { id }, senderWs)
+    
+    senderWs.send(JSON.stringify({
+      type: 'DELETE_EVENT_SUCCESS',
+      data: { id }
+    }))
+    
+    console.log(`✅ Deleted: ${id}`)
+    
+  } catch (error) {
+    console.error('❌ Delete event error:', error)
+    senderWs.send(JSON.stringify({
+      type: 'DELETE_EVENT_ERROR',
+      data: { message: 'Failed to delete event: ' + error.message }
+    }))
   }
-  
-  // Send to Telegram
-  await bot.sendMessage(GROUP_ID, `🗑️ <b>Удалено событие:</b>\n\n📊 #${id}`, { parse_mode: 'HTML' })
-  
-  // Broadcast to clients
-  broadcast('EVENT_DELETED', { id }, senderWs)
-  
-  senderWs.send(JSON.stringify({
-    type: 'DELETE_EVENT_SUCCESS',
-    data: { id }
-  }))
-  
-  console.log(`✅ Deleted: ${id}`)
 }
 
 async function handleLikeEvent(data, senderWs) {
   const { id, isLiked } = data
   
-  // Get current event
-  const event = await getEventById(id)
-  if (!event) {
-    throw new Error('Event not found')
+  try {
+    // Get current event
+    const event = await getEventById(id)
+    if (!event) {
+      throw new Error('Event not found')
+    }
+    
+    // Update likes
+    const newLikes = isLiked 
+      ? event.likes + 1 
+      : Math.max(0, event.likes - 1)
+    
+    await updateEvent(id, { likes: newLikes })
+    
+    // ❌ УБРАЛИ: Спам в группу
+    // const action = isLiked ? 'лайкнул' : 'убрал лайк'
+    // await bot.sendMessage(GROUP_ID, `⚡ Событие ${action}\n\n📊 #${id} (${newLikes} лайков)`, { parse_mode: 'HTML' })
+    
+    // ✅ ДОБАВИЛИ: Команду BOT2
+    await sendCommandToBot2('UPDATE_LIKES', id, {
+      isLiked,
+      likes: newLikes,
+      previousLikes: event.likes
+    })
+    
+    // Broadcast to WebSocket clients
+    broadcast('EVENT_LIKED', { id, isLiked, likes: newLikes }, senderWs)
+    
+    senderWs.send(JSON.stringify({
+      type: 'LIKE_EVENT_SUCCESS',
+      data: { id, isLiked, likes: newLikes }
+    }))
+    
+    console.log(`✅ Like: ${id} - ${isLiked} (${newLikes} total)`)
+    
+  } catch (error) {
+    console.error('❌ Like event error:', error)
+    senderWs.send(JSON.stringify({
+      type: 'LIKE_EVENT_ERROR',
+      data: { message: 'Failed to like event: ' + error.message }
+    }))
   }
-  
-  // Update likes
-  const newLikes = isLiked 
-    ? event.likes + 1 
-    : Math.max(0, event.likes - 1)
-  
-  await updateEvent(id, { likes: newLikes })
-  
-  // Send to Telegram
-  const action = isLiked ? 'лайкнул' : 'убрал лайк'
-  await bot.sendMessage(GROUP_ID, `⚡ Событие ${action}\n\n📊 #${id} (${newLikes} лайков)`, { parse_mode: 'HTML' })
-  
-  // Broadcast to clients
-  broadcast('EVENT_LIKED', { id, isLiked, likes: newLikes }, senderWs)
-  
-  senderWs.send(JSON.stringify({
-    type: 'LIKE_EVENT_SUCCESS',
-    data: { id, isLiked, likes: newLikes }
-  }))
-  
-  console.log(`✅ Like: ${id} - ${isLiked} (${newLikes} total)`)
 }
 
 // ===== TELEGRAM FORMATTING =====
 function formatEventForTelegram(event) {
+  // Чистое сообщение события без служебной информации
   let message = `🎯 <b>${event.title}</b>\n\n${event.description}\n\n`
   
   const meta = []
@@ -669,6 +760,7 @@ function formatEventForTelegram(event) {
     })
   }
   
+  // Только ID и начальные лайки, обновления через BOT2
   message += `\n📊 #${event.id} | ⚡ ${event.likes || 0}`
   
   return message
@@ -713,22 +805,49 @@ app.get('/api/feed', async (req, res) => {
   }
 })
 
-// Health check
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  let bot2Status = 'unknown'
+  
+  try {
+    const response = await fetch(`${BOT2_URL}/health`, { timeout: 3000 })
+    bot2Status = response.ok ? 'connected' : 'error'
+  } catch (error) {
+    bot2Status = 'disconnected'
+  }
+  
   res.json({
     status: 'OK',
+    service: 'BOT1 - Event Creator',
     clients: clients.size,
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    bot2Status,
+    bot2Url: BOT2_URL
   })
 })
 
 // ===== STARTUP =====
 server.listen(PORT, async () => {
-  console.log(`🚀 SQLite server running on port ${PORT}`)
+  console.log(`🚀 BOT1 Event Creator running on port ${PORT}`)
+  console.log(`📝 Creates events in group: ${GROUP_ID}`)
+  console.log(`🔗 Commands to BOT2: ${BOT2_URL}`)
   
   try {
     await initDatabase()
-    console.log(`✅ Ready: WebSocket + HTTP API + Telegram + SQLite`)
+    
+    // Проверяем связь с BOT2
+    try {
+      const response = await fetch(`${BOT2_URL}/health`, { timeout: 5000 })
+      if (response.ok) {
+        console.log('✅ BOT2 connection verified')
+      } else {
+        console.log('⚠️ BOT2 not responding, commands will fail silently')
+      }
+    } catch (error) {
+      console.log('⚠️ BOT2 not available, commands will fail silently')
+    }
+    
+    console.log(`✅ Ready: Clean event creation without group spam`)
+    
   } catch (error) {
     console.error('❌ Startup error:', error)
     process.exit(1)
