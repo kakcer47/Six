@@ -426,20 +426,32 @@ wss.on('connection', (ws, req) => {
 function broadcast(type, data, excludeClient = null) {
   const message = JSON.stringify({ type, data })
   let sent = 0
+  let failed = 0
   
-  clients.forEach(client => {
+  console.log(`📢 Starting broadcast ${type} to ${clients.size} clients`)
+  console.log(`📄 Message data:`, JSON.stringify(data, null, 2))
+  
+  clients.forEach((client) => {
     if (client !== excludeClient && client.readyState === WebSocket.OPEN) {
       try {
         client.send(message)
         sent++
+        console.log(`✅ Sent to client ${client.clientId}`)
       } catch (error) {
-        console.error('Broadcast error:', error)
+        console.error(`💥 Failed to send to client ${client.clientId}:`, error)
         clients.delete(client)
+        failed++
+      }
+    } else {
+      console.log(`⏭️ Skipping client ${client.clientId} (state: ${client.readyState})`)
+      if (client.readyState !== WebSocket.OPEN) {
+        clients.delete(client)
+        failed++
       }
     }
   })
   
-  console.log(`📢 Broadcasted ${type} to ${sent} clients`)
+  console.log(`📊 Broadcast result: ${sent} sent, ${failed} failed, ${clients.size} remaining`)
 }
 
 // ===== WEBSOCKET MESSAGE HANDLERS =====
