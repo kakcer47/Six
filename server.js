@@ -1,4 +1,4 @@
-const express = require('express')
+onst express = require('express')
 const http = require('http')
 const WebSocket = require('ws')
 const TelegramBot = require('node-telegram-bot-api')
@@ -13,8 +13,6 @@ const BOT_TOKEN = '7229365201:AAHVSXlcoU06UVsTn3Vwp9deRndatnlJLVA'
 const GROUP_ID = '-1002268255207'
 const PORT = process.env.PORT || 3001
 
-// Initialize Telegram bot
-const bot = new TelegramBot(BOT_TOKEN, { polling: true })
 
 // Middleware
 app.use(cors())
