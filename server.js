@@ -3,6 +3,7 @@ const http = require('http')
 const WebSocket = require('ws')
 const TelegramBot = require('node-telegram-bot-api')
 const cors = require('cors')
+const axios = require('axios')
 
 const app = express()
 const server = http.createServer(app)
@@ -12,7 +13,7 @@ const wss = new WebSocket.Server({ server })
 const BOT_TOKEN = '7229365201:AAHVSXlcoU06UVsTn3Vwp9deRndatnlJLVA'
 const GROUP_ID = '-1002268255207'
 const PORT = process.env.PORT || 3001
-const bot = new TelegramBot(BOT_TOKEN)
+const BOT2_URL = process.env.BOT2_URL || 'https://six-z05l.onrender.com'
 
 // Middleware
 app.use(cors())
@@ -47,6 +48,34 @@ function broadcast(data) {
   })
 }
 
+// Sync with Bot 2
+async function syncWithBot2(action, data) {
+  try {
+    let response
+    switch (action) {
+      case 'create':
+        response = await axios.post(`${BOT2_URL}/api/events`, data)
+        break
+      case 'update':
+        response = await axios.put(`${BOT2_URL}/api/events/${data.id}`, data)
+        break
+      case 'delete':
+        response = await axios.delete(`${BOT2_URL}/api/events/${data.id}`)
+        break
+      case 'like':
+        // Implement like endpoint in Bot 2
+        response = await axios.patch(`${BOT2_URL}/api/events/${data.id}/like`, { 
+          isLiked: data.isLiked 
+        })
+        break
+    }
+    return response?.data
+  } catch (error) {
+    console.error(`Failed to sync ${action} with Bot 2:`, error.message)
+    throw error
+  }
+}
+
 // Format event for Telegram
 function formatEventForTelegram(event) {
   let message = `🎯 <b>${event.title}</b>\n\n`
@@ -68,14 +97,9 @@ function formatEventForTelegram(event) {
 // Routes
 app.post('/create', async (req, res) => {
   try {
-    const event = {
-      id: Date.now().toString(),
-      ...req.body,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      likes: 0,
-      isLiked: false
-    }
+    // First sync with Bot 2 to get the event with proper ID
+    const eventData = await syncWithBot2('create', req.body)
+    const event = eventData.event
 
     // Send to Telegram group
     const telegramMessage = formatEventForTelegram(event)
@@ -97,11 +121,10 @@ app.post('/create', async (req, res) => {
 app.post('/update', async (req, res) => {
   try {
     const { id, ...updates } = req.body
-    const event = {
-      ...updates,
-      id,
-      updatedAt: new Date().toISOString()
-    }
+    
+    // Sync with Bot 2
+    const eventData = await syncWithBot2('update', { id, ...updates })
+    const event = eventData.event
 
     // Update in Telegram group (send new message)
     const telegramMessage = `✏️ <b>Updated:</b>\n\n${formatEventForTelegram(event)}`
@@ -124,6 +147,9 @@ app.post('/delete', async (req, res) => {
   try {
     const { id } = req.body
 
+    // Sync with Bot 2
+    await syncWithBot2('delete', { id })
+
     // Send deletion notice to Telegram group
     await bot.sendMessage(GROUP_ID, `🗑️ <b>Event deleted</b>\n\nEvent ID: ${id}`, { parse_mode: 'HTML' })
 
@@ -144,6 +170,9 @@ app.post('/like', async (req, res) => {
   try {
     const { id, isLiked } = req.body
 
+    // Sync with Bot 2
+    await syncWithBot2('like', { id, isLiked })
+
     // Send like update to Telegram group
     const action = isLiked ? 'liked' : 'unliked'
     await bot.sendMessage(GROUP_ID, `⚡ Event ${action}\n\nEvent ID: ${id}`, { parse_mode: 'HTML' })
@@ -163,18 +192,4 @@ app.post('/like', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'OK', clients: clients.size })
-})
-
-// Error handler
-app.use((error, req, res, next) => {
-  console.error('Server error:', error)
-  res.status(500).json({ error: 'Internal server error' })
-})
-
-// Start server
-server.listen(PORT, () => {
-  console.log(`Bot 1 server running on port ${PORT}`)
-  console.log(`WebSocket server ready`)
-  console.log(`Telegram bot initialized`)
-})
+  res.json({ status
