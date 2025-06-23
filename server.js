@@ -3,7 +3,8 @@ const http = require('http')
 const WebSocket = require('ws')
 const TelegramBot = require('node-telegram-bot-api')
 const cors = require('cors')
-const fs = require('fs').promises
+const sqlite3 = require('sqlite3').verbose()
+const fs = require('fs')
 const path = require('path')
 
 const app = express()
@@ -14,90 +15,311 @@ const wss = new WebSocket.Server({ server })
 const BOT_TOKEN = '7229365201:AAHVSXlcoU06UVsTn3Vwp9deRndatnlJLVA'
 const GROUP_ID = '-1002268255207'
 const PORT = process.env.PORT || 3001
-const WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://sub-muey.onrender.com'
 
 // Initialize Telegram bot
 const bot = new TelegramBot(BOT_TOKEN)
 
 // Middleware
 app.use(cors())
-app.use('/webhook', express.raw({ type: 'application/json' }))
 app.use(express.json())
 
-// ===== UNIFIED DATA STORAGE =====
-let events = new Map() // id -> event (быстрый поиск)
-let eventsList = [] // Отсортированный список для ленты
-let lastProcessedMessageId = 0
+// SQLite Database
+const DB_PATH = ':memory:' // В памяти - не сохраняется на диск
+let db = null
 
-const EVENTS_FILE = path.join(__dirname, 'events.json')
+// WebSocket clients
 const clients = new Set()
 
-// ===== UNIFIED EVENT FORMAT =====
-function createEvent(data) {
-  return {
-    id: data.id || `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-    title: data.title,
-    description: data.description || data.content,
-    author: {
-      id: data.authorId || data.author?.id,
-      fullName: data.author?.fullName || data.author?.name,
-      username: data.author?.username,
-      avatar: data.author?.avatar || data.author?.photo,
-      telegramId: data.author?.telegramId
-    },
-    meta: {
-      city: data.city || data.meta?.city || '',
-      category: data.category || data.meta?.tag || '',
-      gender: data.gender || data.meta?.gender || '',
-      ageGroup: data.ageGroup || data.meta?.age || ''
-    },
-    stats: {
-      likes: data.likes || data.stats?.likes || 0,
-      views: data.views || data.stats?.views || 0,
-      isLiked: data.isLiked || false
-    },
-    timestamps: {
-      createdAt: data.createdAt || new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    },
-    contacts: data.contacts || [],
-    status: data.status || 'active',
-    telegramMessageId: data.telegramMessageId
-  }
-}
-
-// ===== DATA PERSISTENCE =====
-async function loadEvents() {
-  try {
-    const data = await fs.readFile(EVENTS_FILE, 'utf8')
-    const savedData = JSON.parse(data)
-    
-    events.clear()
-    eventsList = []
-    
-    savedData.events?.forEach(eventData => {
-      const event = createEvent(eventData)
-      events.set(event.id, event)
-      eventsList.push(event)
+// ===== SQLITE SETUP =====
+function initDatabase() {
+  return new Promise((resolve, reject) => {
+    db = new sqlite3.Database(DB_PATH, (err) => {
+      if (err) {
+        reject(err)
+        return
+      }
+      
+      // Create events table
+      db.run(`
+        CREATE TABLE events (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          description TEXT NOT NULL,
+          author_id TEXT NOT NULL,
+          author_name TEXT NOT NULL,
+          author_username TEXT,
+          author_avatar TEXT,
+          city TEXT,
+          category TEXT,
+          gender TEXT,
+          age_group TEXT,
+          likes INTEGER DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          telegram_msg_id INTEGER,
+          contacts TEXT,
+          status TEXT DEFAULT 'active'
+        )
+      `, (err) => {
+        if (err) {
+          reject(err)
+        } else {
+          console.log('✅ SQLite database initialized')
+          resolve()
+        }
+      })
     })
-    
-    lastProcessedMessageId = savedData.lastProcessedMessageId || 0
-    console.log(`📁 Loaded ${events.size} events`)
-  } catch (error) {
-    console.log('📁 Starting fresh - no existing data')
-  }
+  })
 }
 
-async function saveEvents() {
-  try {
-    const data = {
-      events: Array.from(events.values()),
-      lastProcessedMessageId,
-      updatedAt: new Date().toISOString()
+// ===== EVENT OPERATIONS =====
+function insertEvent(event) {
+  return new Promise((resolve, reject) => {
+    const sql = `
+      INSERT INTO events (
+        id, title, description, author_id, author_name, author_username, 
+        author_avatar, city, category, gender, age_group, likes,
+        created_at, updated_at, telegram_msg_id, contacts, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `
+    
+    const values = [
+      event.id,
+      event.title,
+      event.description,
+      event.authorId,
+      event.author.fullName,
+      event.author.username || null,
+      event.author.avatar || null,
+      event.city || '',
+      event.category || '',
+      event.gender || '',
+      event.ageGroup || '',
+      event.likes || 0,
+      Date.now(),
+      Date.now(),
+      event.telegramMessageId || null,
+      JSON.stringify(event.contacts || []),
+      event.status || 'active'
+    ]
+    
+    db.run(sql, values, function(err) {
+      if (err) {
+        reject(err)
+      } else {
+        resolve(event)
+      }
+    })
+  })
+}
+
+function updateEvent(id, updates) {
+  return new Promise((resolve, reject) => {
+    let setParts = []
+    let values = []
+    
+    if (updates.title) {
+      setParts.push('title = ?')
+      values.push(updates.title)
     }
-    await fs.writeFile(EVENTS_FILE, JSON.stringify(data, null, 2))
-  } catch (error) {
-    console.error('💾 Save error:', error)
+    if (updates.description) {
+      setParts.push('description = ?')
+      values.push(updates.description)
+    }
+    if (updates.likes !== undefined) {
+      setParts.push('likes = ?')
+      values.push(updates.likes)
+    }
+    if (updates.city) {
+      setParts.push('city = ?')
+      values.push(updates.city)
+    }
+    if (updates.category) {
+      setParts.push('category = ?')
+      values.push(updates.category)
+    }
+    
+    setParts.push('updated_at = ?')
+    values.push(Date.now())
+    values.push(id)
+    
+    const sql = `UPDATE events SET ${setParts.join(', ')} WHERE id = ?`
+    
+    db.run(sql, values, function(err) {
+      if (err) {
+        reject(err)
+      } else {
+        // Get updated event
+        getEventById(id).then(resolve).catch(reject)
+      }
+    })
+  })
+}
+
+function deleteEvent(id) {
+  return new Promise((resolve, reject) => {
+    db.run('DELETE FROM events WHERE id = ?', [id], function(err) {
+      if (err) {
+        reject(err)
+      } else {
+        resolve({ id, deleted: this.changes > 0 })
+      }
+    })
+  })
+}
+
+function getEventById(id) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT * FROM events WHERE id = ?', [id], (err, row) => {
+      if (err) {
+        reject(err)
+      } else {
+        resolve(row ? formatEventForFrontend(row) : null)
+      }
+    })
+  })
+}
+
+function queryEvents(filters = {}) {
+  return new Promise((resolve, reject) => {
+    let sql = 'SELECT * FROM events WHERE status = "active"'
+    let params = []
+    
+    // Filters
+    if (filters.search) {
+      sql += ' AND (title LIKE ? OR description LIKE ?)'
+      const searchTerm = `%${filters.search}%`
+      params.push(searchTerm, searchTerm)
+    }
+    
+    if (filters.city) {
+      sql += ' AND city = ?'
+      params.push(filters.city)
+    }
+    
+    if (filters.category) {
+      sql += ' AND category = ?'
+      params.push(filters.category)
+    }
+    
+    if (filters.gender) {
+      sql += ' AND gender = ?'
+      params.push(filters.gender)
+    }
+    
+    if (filters.ageGroup) {
+      sql += ' AND age_group = ?'
+      params.push(filters.ageGroup)
+    }
+    
+    if (filters.authorId) {
+      sql += ' AND author_id = ?'
+      params.push(filters.authorId)
+    }
+    
+    // Sorting
+    if (filters.sort === 'popularity') {
+      sql += ' ORDER BY likes DESC, created_at DESC'
+    } else if (filters.sort === 'old') {
+      sql += ' ORDER BY created_at ASC'
+    } else {
+      sql += ' ORDER BY created_at DESC' // default: newest first
+    }
+    
+    // Pagination
+    if (filters.limit) {
+      sql += ' LIMIT ?'
+      params.push(parseInt(filters.limit))
+      
+      if (filters.offset) {
+        sql += ' OFFSET ?'
+        params.push(parseInt(filters.offset))
+      }
+    }
+    
+    db.all(sql, params, (err, rows) => {
+      if (err) {
+        reject(err)
+      } else {
+        const events = rows.map(formatEventForFrontend)
+        resolve(events)
+      }
+    })
+  })
+}
+
+function getTotalCount(filters = {}) {
+  return new Promise((resolve, reject) => {
+    let sql = 'SELECT COUNT(*) as count FROM events WHERE status = "active"'
+    let params = []
+    
+    // Same filters as queryEvents
+    if (filters.search) {
+      sql += ' AND (title LIKE ? OR description LIKE ?)'
+      const searchTerm = `%${filters.search}%`
+      params.push(searchTerm, searchTerm)
+    }
+    
+    if (filters.city) {
+      sql += ' AND city = ?'
+      params.push(filters.city)
+    }
+    
+    if (filters.category) {
+      sql += ' AND category = ?'
+      params.push(filters.category)
+    }
+    
+    if (filters.gender) {
+      sql += ' AND gender = ?'
+      params.push(filters.gender)
+    }
+    
+    if (filters.ageGroup) {
+      sql += ' AND age_group = ?'
+      params.push(filters.ageGroup)
+    }
+    
+    if (filters.authorId) {
+      sql += ' AND author_id = ?'
+      params.push(filters.authorId)
+    }
+    
+    db.get(sql, params, (err, row) => {
+      if (err) {
+        reject(err)
+      } else {
+        resolve(row.count)
+      }
+    })
+  })
+}
+
+// Format for frontend compatibility
+function formatEventForFrontend(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    authorId: row.author_id,
+    author: {
+      fullName: row.author_name,
+      username: row.author_username,
+      avatar: row.author_avatar,
+      telegramId: row.author_id
+    },
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+    likes: row.likes,
+    isLiked: false, // TODO: implement user-specific likes
+    city: row.city,
+    category: row.category,
+    gender: row.gender,
+    ageGroup: row.age_group,
+    date: new Date(row.created_at).toISOString(),
+    contacts: JSON.parse(row.contacts || '[]'),
+    status: row.status,
+    telegramMessageId: row.telegram_msg_id
   }
 }
 
@@ -161,182 +383,153 @@ function broadcast(type, data, excludeClient = null) {
 async function handleWebSocketMessage(message, senderWs) {
   const { type, data } = message
 
-  switch (type) {
-    case 'CREATE_EVENT':
-      await handleCreateEvent(data, senderWs)
-      break
-    case 'UPDATE_EVENT':
-      await handleUpdateEvent(data, senderWs)
-      break
-    case 'DELETE_EVENT':
-      await handleDeleteEvent(data, senderWs)
-      break
-    case 'LIKE_EVENT':
-      await handleLikeEvent(data, senderWs)
-      break
-    case 'PING':
-      senderWs.send(JSON.stringify({ type: 'PONG', data: { timestamp: Date.now() } }))
-      break
-    default:
-      senderWs.send(JSON.stringify({
-        type: 'ERROR',
-        data: { message: `Unknown message type: ${type}` }
-      }))
+  try {
+    switch (type) {
+      case 'CREATE_EVENT':
+        await handleCreateEvent(data, senderWs)
+        break
+      case 'UPDATE_EVENT':
+        await handleUpdateEvent(data, senderWs)
+        break
+      case 'DELETE_EVENT':
+        await handleDeleteEvent(data, senderWs)
+        break
+      case 'LIKE_EVENT':
+        await handleLikeEvent(data, senderWs)
+        break
+      case 'PING':
+        senderWs.send(JSON.stringify({ type: 'PONG', data: { timestamp: Date.now() } }))
+        break
+      default:
+        senderWs.send(JSON.stringify({
+          type: 'ERROR',
+          data: { message: `Unknown message type: ${type}` }
+        }))
+    }
+  } catch (error) {
+    console.error('WebSocket handler error:', error)
+    senderWs.send(JSON.stringify({
+      type: `${type}_ERROR`,
+      data: { message: error.message }
+    }))
   }
 }
 
 async function handleCreateEvent(data, senderWs) {
-  try {
-    const event = createEvent(data)
-    
-    // Store event
-    events.set(event.id, event)
-    eventsList.unshift(event) // Newest first
-    
-    // Send to Telegram
-    const telegramMessage = formatEventForTelegram(event)
-    const sentMessage = await bot.sendMessage(GROUP_ID, telegramMessage, { parse_mode: 'HTML' })
-    event.telegramMessageId = sentMessage.message_id
-    
-    // Save to file
-    await saveEvents()
-    
-    // Broadcast to all clients
-    broadcast('EVENT_CREATED', event, senderWs)
-    
-    // Respond to sender
-    senderWs.send(JSON.stringify({
-      type: 'CREATE_EVENT_SUCCESS',
-      data: event
-    }))
-    
-    console.log(`✅ Created: ${event.title}`)
-    
-  } catch (error) {
-    console.error('Create error:', error)
-    senderWs.send(JSON.stringify({
-      type: 'CREATE_EVENT_ERROR',
-      data: { message: 'Failed to create event' }
-    }))
+  // Create event object
+  const event = {
+    id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+    title: data.title,
+    description: data.description,
+    authorId: data.authorId,
+    author: data.author,
+    city: data.city || '',
+    category: data.category || '',
+    gender: data.gender || '',
+    ageGroup: data.ageGroup || '',
+    likes: 0,
+    contacts: data.contacts || [],
+    status: 'active'
   }
+  
+  // Send to Telegram first
+  const telegramMessage = formatEventForTelegram(event)
+  const sentMessage = await bot.sendMessage(GROUP_ID, telegramMessage, { parse_mode: 'HTML' })
+  event.telegramMessageId = sentMessage.message_id
+  
+  // Store in SQLite
+  await insertEvent(event)
+  
+  // Broadcast to clients
+  broadcast('EVENT_CREATED', event, senderWs)
+  
+  // Respond to sender
+  senderWs.send(JSON.stringify({
+    type: 'CREATE_EVENT_SUCCESS',
+    data: event
+  }))
+  
+  console.log(`✅ Created: ${event.title}`)
 }
 
 async function handleUpdateEvent(data, senderWs) {
-  try {
-    const { id, ...updates } = data
-    const existingEvent = events.get(id)
-    
-    if (!existingEvent) {
-      throw new Error('Event not found')
-    }
-    
-    // Update event
-    const updatedEvent = createEvent({ ...existingEvent, ...updates })
-    events.set(id, updatedEvent)
-    
-    // Update in list
-    const listIndex = eventsList.findIndex(e => e.id === id)
-    if (listIndex !== -1) {
-      eventsList[listIndex] = updatedEvent
-    }
-    
-    // Send to Telegram
-    const telegramMessage = `✏️ <b>Обновлено:</b>\n\n${formatEventForTelegram(updatedEvent)}`
-    await bot.sendMessage(GROUP_ID, telegramMessage, { parse_mode: 'HTML' })
-    
-    await saveEvents()
-    broadcast('EVENT_UPDATED', updatedEvent, senderWs)
-    
-    senderWs.send(JSON.stringify({
-      type: 'UPDATE_EVENT_SUCCESS',
-      data: updatedEvent
-    }))
-    
-    console.log(`✅ Updated: ${updatedEvent.title}`)
-    
-  } catch (error) {
-    console.error('Update error:', error)
-    senderWs.send(JSON.stringify({
-      type: 'UPDATE_EVENT_ERROR',
-      data: { message: error.message }
-    }))
+  const { id, ...updates } = data
+  
+  // Update in SQLite
+  const updatedEvent = await updateEvent(id, updates)
+  
+  if (!updatedEvent) {
+    throw new Error('Event not found')
   }
+  
+  // Send to Telegram
+  const telegramMessage = `✏️ <b>Обновлено:</b>\n\n${formatEventForTelegram(updatedEvent)}`
+  await bot.sendMessage(GROUP_ID, telegramMessage, { parse_mode: 'HTML' })
+  
+  // Broadcast to clients
+  broadcast('EVENT_UPDATED', updatedEvent, senderWs)
+  
+  senderWs.send(JSON.stringify({
+    type: 'UPDATE_EVENT_SUCCESS',
+    data: updatedEvent
+  }))
+  
+  console.log(`✅ Updated: ${updatedEvent.title}`)
 }
 
 async function handleDeleteEvent(data, senderWs) {
-  try {
-    const { id } = data
-    const event = events.get(id)
-    
-    if (!event) {
-      throw new Error('Event not found')
-    }
-    
-    // Remove from storage
-    events.delete(id)
-    eventsList = eventsList.filter(e => e.id !== id)
-    
-    // Send to Telegram
-    await bot.sendMessage(GROUP_ID, `🗑️ <b>Удалено событие:</b>\n\n📊 #${id}`, { parse_mode: 'HTML' })
-    
-    await saveEvents()
-    broadcast('EVENT_DELETED', { id }, senderWs)
-    
-    senderWs.send(JSON.stringify({
-      type: 'DELETE_EVENT_SUCCESS',
-      data: { id }
-    }))
-    
-    console.log(`✅ Deleted: ${id}`)
-    
-  } catch (error) {
-    console.error('Delete error:', error)
-    senderWs.send(JSON.stringify({
-      type: 'DELETE_EVENT_ERROR',
-      data: { message: error.message }
-    }))
+  const { id } = data
+  
+  // Delete from SQLite
+  const result = await deleteEvent(id)
+  
+  if (!result.deleted) {
+    throw new Error('Event not found')
   }
+  
+  // Send to Telegram
+  await bot.sendMessage(GROUP_ID, `🗑️ <b>Удалено событие:</b>\n\n📊 #${id}`, { parse_mode: 'HTML' })
+  
+  // Broadcast to clients
+  broadcast('EVENT_DELETED', { id }, senderWs)
+  
+  senderWs.send(JSON.stringify({
+    type: 'DELETE_EVENT_SUCCESS',
+    data: { id }
+  }))
+  
+  console.log(`✅ Deleted: ${id}`)
 }
 
 async function handleLikeEvent(data, senderWs) {
-  try {
-    const { id, isLiked } = data
-    const event = events.get(id)
-    
-    if (!event) {
-      throw new Error('Event not found')
-    }
-    
-    // Update likes
-    const newLikes = isLiked 
-      ? event.stats.likes + 1 
-      : Math.max(0, event.stats.likes - 1)
-    
-    event.stats.likes = newLikes
-    event.stats.isLiked = isLiked
-    event.timestamps.updatedAt = new Date().toISOString()
-    
-    // Send to Telegram
-    const action = isLiked ? 'лайкнул' : 'убрал лайк'
-    await bot.sendMessage(GROUP_ID, `⚡ Событие ${action}\n\n📊 #${id} (${newLikes} лайков)`, { parse_mode: 'HTML' })
-    
-    await saveEvents()
-    broadcast('EVENT_LIKED', { id, isLiked, likes: newLikes }, senderWs)
-    
-    senderWs.send(JSON.stringify({
-      type: 'LIKE_EVENT_SUCCESS',
-      data: { id, isLiked, likes: newLikes }
-    }))
-    
-    console.log(`✅ Like: ${id} - ${isLiked} (${newLikes} total)`)
-    
-  } catch (error) {
-    console.error('Like error:', error)
-    senderWs.send(JSON.stringify({
-      type: 'LIKE_EVENT_ERROR',
-      data: { message: error.message }
-    }))
+  const { id, isLiked } = data
+  
+  // Get current event
+  const event = await getEventById(id)
+  if (!event) {
+    throw new Error('Event not found')
   }
+  
+  // Update likes
+  const newLikes = isLiked 
+    ? event.likes + 1 
+    : Math.max(0, event.likes - 1)
+  
+  await updateEvent(id, { likes: newLikes })
+  
+  // Send to Telegram
+  const action = isLiked ? 'лайкнул' : 'убрал лайк'
+  await bot.sendMessage(GROUP_ID, `⚡ Событие ${action}\n\n📊 #${id} (${newLikes} лайков)`, { parse_mode: 'HTML' })
+  
+  // Broadcast to clients
+  broadcast('EVENT_LIKED', { id, isLiked, likes: newLikes }, senderWs)
+  
+  senderWs.send(JSON.stringify({
+    type: 'LIKE_EVENT_SUCCESS',
+    data: { id, isLiked, likes: newLikes }
+  }))
+  
+  console.log(`✅ Like: ${id} - ${isLiked} (${newLikes} total)`)
 }
 
 // ===== TELEGRAM FORMATTING =====
@@ -344,10 +537,10 @@ function formatEventForTelegram(event) {
   let message = `🎯 <b>${event.title}</b>\n\n${event.description}\n\n`
   
   const meta = []
-  if (event.meta.city) meta.push(`📍 ${event.meta.city}`)
-  if (event.meta.category) meta.push(`🏷️ ${event.meta.category}`)
-  if (event.meta.gender) meta.push(`👤 ${event.meta.gender}`)
-  if (event.meta.ageGroup) meta.push(`🎂 ${event.meta.ageGroup}`)
+  if (event.city) meta.push(`📍 ${event.city}`)
+  if (event.category) meta.push(`🏷️ ${event.category}`)
+  if (event.gender) meta.push(`👤 ${event.gender}`)
+  if (event.ageGroup) meta.push(`🎂 ${event.ageGroup}`)
   
   if (meta.length > 0) {
     message += meta.join(' | ') + '\n\n'
@@ -365,84 +558,43 @@ function formatEventForTelegram(event) {
     })
   }
   
-  message += `\n📊 #${event.id} | ⚡ ${event.stats.likes}`
+  message += `\n📊 #${event.id} | ⚡ ${event.likes || 0}`
   
   return message
 }
 
-// ===== HTTP API (для фронтенда) =====
-app.get('/api/feed', (req, res) => {
+// ===== HTTP API =====
+app.get('/api/feed', async (req, res) => {
   try {
     const {
       search, city, category, gender, ageGroup, authorId,
       sort = 'new', page = 1, limit = 20
     } = req.query
 
-    let filtered = [...eventsList]
-
-    // Search
-    if (search) {
-      const query = search.toLowerCase()
-      filtered = filtered.filter(event => 
-        event.title.toLowerCase().includes(query) ||
-        event.description.toLowerCase().includes(query)
-      )
+    const filters = {
+      search, city, category, gender, 
+      ageGroup, authorId, sort,
+      limit: parseInt(limit),
+      offset: (parseInt(page) - 1) * parseInt(limit)
     }
 
-    // Filters
-    if (city) filtered = filtered.filter(e => e.meta.city === city)
-    if (category) filtered = filtered.filter(e => e.meta.category === category)
-    if (gender) filtered = filtered.filter(e => e.meta.gender === gender)
-    if (ageGroup) filtered = filtered.filter(e => e.meta.ageGroup === ageGroup)
-    if (authorId) filtered = filtered.filter(e => e.author.id === authorId)
+    // Get events and total count
+    const [events, totalCount] = await Promise.all([
+      queryEvents(filters),
+      getTotalCount(filters)
+    ])
 
-    // Sort
-    if (sort === 'popularity') {
-      filtered.sort((a, b) => b.stats.likes - a.stats.likes)
-    } else if (sort === 'old') {
-      filtered.sort((a, b) => new Date(a.timestamps.createdAt) - new Date(b.timestamps.createdAt))
-    }
-    // 'new' - already sorted by default
-
-    // Pagination
-    const startIndex = (page - 1) * limit
-    const endIndex = startIndex + parseInt(limit)
-    const paginatedEvents = filtered.slice(startIndex, endIndex)
-
-    // Convert to frontend format
-    const frontendEvents = paginatedEvents.map(event => ({
-      id: event.id,
-      title: event.title,
-      description: event.description,
-      authorId: event.author.id,
-      author: {
-        fullName: event.author.fullName,
-        username: event.author.username,
-        avatar: event.author.avatar,
-        telegramId: event.author.telegramId
-      },
-      createdAt: event.timestamps.createdAt,
-      updatedAt: event.timestamps.updatedAt,
-      likes: event.stats.likes,
-      isLiked: event.stats.isLiked,
-      city: event.meta.city,
-      category: event.meta.category,
-      gender: event.meta.gender,
-      ageGroup: event.meta.ageGroup,
-      date: event.timestamps.createdAt,
-      contacts: event.contacts,
-      status: event.status
-    }))
+    const hasMore = filters.offset + events.length < totalCount
 
     res.json({
-      posts: frontendEvents,
-      hasMore: filtered.length > endIndex,
-      total: filtered.length,
+      posts: events,
+      hasMore,
+      total: totalCount,
       page: parseInt(page),
       limit: parseInt(limit)
     })
 
-    console.log(`📋 Feed: ${frontendEvents.length}/${filtered.length} events (page ${page})`)
+    console.log(`📋 Feed: ${events.length}/${totalCount} events (page ${page})`)
 
   } catch (error) {
     console.error('Feed error:', error)
@@ -450,66 +602,24 @@ app.get('/api/feed', (req, res) => {
   }
 })
 
-// ===== WEBHOOK (для Telegram) =====
-app.post('/webhook', (req, res) => {
-  try {
-    const update = JSON.parse(req.body.toString())
-    
-    if (update.message && 
-        update.message.chat.id.toString() === GROUP_ID &&
-        update.message.text &&
-        update.message.message_id > lastProcessedMessageId) {
-      
-      console.log(`📨 Webhook: ${update.message.message_id}`)
-      lastProcessedMessageId = update.message.message_id
-      
-      // В будущем можно добавить парсинг внешних команд
-      // Пока просто логируем
-    }
-    
-    res.status(200).send('OK')
-  } catch (error) {
-    console.error('Webhook error:', error)
-    res.status(500).send('Error')
-  }
-})
-
-// ===== HEALTH & DEBUG =====
+// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'OK',
-    events: events.size,
     clients: clients.size,
     uptime: process.uptime()
   })
 })
 
-app.get('/api/stats', (req, res) => {
-  res.json({
-    totalEvents: events.size,
-    connectedClients: clients.size,
-    lastProcessedMessageId
-  })
-})
-
 // ===== STARTUP =====
-async function setupWebhook() {
-  try {
-    await bot.setWebHook(`${WEBHOOK_URL}/webhook`)
-    console.log(`🔗 Webhook set: ${WEBHOOK_URL}/webhook`)
-  } catch (error) {
-    console.error('Webhook setup error:', error)
-  }
-}
-
 server.listen(PORT, async () => {
-  console.log(`🚀 Unified server running on port ${PORT}`)
+  console.log(`🚀 SQLite server running on port ${PORT}`)
   
-  await loadEvents()
-  await setupWebhook()
-  
-  console.log(`✅ Ready: ${events.size} events, WebSocket + HTTP API + Telegram`)
-  
-  // Periodic save
-  setInterval(saveEvents, 5 * 60 * 1000)
+  try {
+    await initDatabase()
+    console.log(`✅ Ready: WebSocket + HTTP API + Telegram + SQLite`)
+  } catch (error) {
+    console.error('❌ Startup error:', error)
+    process.exit(1)
+  }
 })
