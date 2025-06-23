@@ -12,7 +12,7 @@ const wss = new WebSocket.Server({ server })
 const BOT_TOKEN = '7229365201:AAHVSXlcoU06UVsTn3Vwp9deRndatnlJLVA'
 const GROUP_ID = '-1002268255207'
 const PORT = process.env.PORT || 3001
-
+const bot = new TelegramBot(BOT_TOKEN)
 
 // Middleware
 app.use(cors())
