@@ -24,19 +24,45 @@ app.use(express.json())
 const clients = new Set()
 
 // WebSocket connection handler
-wss.on('connection', (ws) => {
-  console.log('New WebSocket connection')
+wss.on('connection', (ws, req) => {
+  const clientId = Date.now().toString()
+  const clientIP = req.socket.remoteAddress
+  
+  console.log(`🔗 New WebSocket connection - ID: ${clientId}, IP: ${clientIP}`)
+  console.log(`👥 Total clients: ${clients.size + 1}`)
+  
+  ws.clientId = clientId
   clients.add(ws)
+
+  // Send welcome message with client info
+  ws.send(JSON.stringify({
+    type: 'CONNECTED',
+    message: 'WebSocket connected successfully',
+    clientId: clientId,
+    timestamp: Date.now()
+  }))
+
+  // Heartbeat mechanism
+  ws.isAlive = true
+  ws.on('pong', () => {
+    ws.isAlive = true
+  })
 
   // Listen for messages from frontend
   ws.on('message', async (data) => {
     try {
       const message = JSON.parse(data.toString())
-      console.log('Received WebSocket message:', message.type)
+      console.log(`📨 Message from client ${clientId}:`, message.type)
+      
+      // Handle ping manually
+      if (message.type === 'PING') {
+        ws.send(JSON.stringify({ type: 'PONG', timestamp: Date.now() }))
+        return
+      }
       
       await handleWebSocketMessage(message, ws)
     } catch (error) {
-      console.error('Error processing WebSocket message:', error)
+      console.error(`💥 Error processing message from client ${clientId}:`, error)
       ws.send(JSON.stringify({
         type: 'ERROR',
         message: 'Failed to process message'
@@ -44,21 +70,16 @@ wss.on('connection', (ws) => {
     }
   })
 
-  ws.on('close', () => {
-    console.log('WebSocket connection closed')
+  ws.on('close', (code, reason) => {
+    console.log(`🔌 WebSocket disconnected - ID: ${clientId}, Code: ${code}, Reason: ${reason}`)
     clients.delete(ws)
+    console.log(`👥 Remaining clients: ${clients.size}`)
   })
 
   ws.on('error', (error) => {
-    console.error('WebSocket error:', error)
+    console.error(`💥 WebSocket error - ID: ${clientId}:`, error)
     clients.delete(ws)
   })
-
-  // Send welcome message
-  ws.send(JSON.stringify({
-    type: 'CONNECTED',
-    message: 'WebSocket connected successfully'
-  }))
 })
 
 // Handle WebSocket messages from frontend
@@ -229,13 +250,32 @@ async function handleLikeEvent(data, senderWs) {
 // Broadcast to all connected clients
 function broadcast(data) {
   const message = JSON.stringify(data)
-  console.log(`Broadcasting to ${clients.size} clients:`, data.type)
+  const activeClients = Array.from(clients).filter(client => client.readyState === WebSocket.OPEN)
   
-  clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(message)
+  console.log(`📢 Broadcasting to ${activeClients.length}/${clients.size} clients:`, data.type)
+  console.log(`💬 Message:`, JSON.stringify(data, null, 2))
+  
+  let successCount = 0
+  let errorCount = 0
+  
+  clients.forEach((client, index) => {
+    try {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(message)
+        successCount++
+        console.log(`✅ Sent to client ${index + 1}`)
+      } else {
+        console.log(`❌ Client ${index + 1} not ready (state: ${client.readyState})`)
+        clients.delete(client) // Remove dead connections
+      }
+    } catch (error) {
+      console.error(`💥 Error sending to client ${index + 1}:`, error)
+      clients.delete(client)
+      errorCount++
     }
   })
+  
+  console.log(`📊 Broadcast result: ${successCount} success, ${errorCount} errors, ${clients.size} remaining`)
 }
 
 // Format event for Telegram
@@ -268,10 +308,38 @@ app.get('/health', (req, res) => {
 
 // WebSocket info endpoint
 app.get('/ws-info', (req, res) => {
+  const clientsInfo = Array.from(clients).map((ws, index) => ({
+    id: ws.clientId || `client-${index}`,
+    readyState: ws.readyState,
+    isAlive: ws.isAlive,
+    readyStateText: ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][ws.readyState]
+  }))
+
   res.json({
     connectedClients: clients.size,
+    activeClients: Array.from(clients).filter(ws => ws.readyState === WebSocket.OPEN).length,
     wsUrl: `ws://${req.get('host')}`,
-    protocols: ['json']
+    protocols: ['json'],
+    clients: clientsInfo
+  })
+})
+
+// Debugging endpoint to manually test broadcast
+app.post('/test-broadcast', (req, res) => {
+  const testMessage = {
+    type: 'TEST_BROADCAST',
+    data: {
+      message: 'This is a test broadcast',
+      timestamp: Date.now()
+    }
+  }
+  
+  broadcast(testMessage)
+  
+  res.json({
+    success: true,
+    message: 'Test broadcast sent',
+    clientsCount: clients.size
   })
 })
 
@@ -292,4 +360,23 @@ server.listen(PORT, () => {
   console.log(`  - DELETE_EVENT: Delete event`)
   console.log(`  - LIKE_EVENT: Like/unlike event`)
   console.log(`  - PING: Health check`)
+  
+  // Heartbeat interval to check client connections
+  setInterval(() => {
+    console.log(`💓 Heartbeat check - ${clients.size} clients`)
+    
+    clients.forEach((ws) => {
+      if (ws.isAlive === false) {
+        console.log(`💀 Terminating dead client: ${ws.clientId}`)
+        ws.terminate()
+        clients.delete(ws)
+        return
+      }
+      
+      ws.isAlive = false
+      ws.ping()
+    })
+    
+    console.log(`💓 After cleanup: ${clients.size} active clients`)
+  }, 30000) // Check every 30 seconds
 })
