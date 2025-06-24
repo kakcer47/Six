@@ -443,6 +443,7 @@ class DistributedEventServer {
 
         for (const event of events) {
           this.addToCache(event.id, event)
+          this.saveCacheToFile() 
         }
 
         console.log(`💾 Loaded ${events.length} events from file`)
@@ -472,6 +473,7 @@ class DistributedEventServer {
       for (const row of result.rows) {
         const event = this.formatEventFromDB(row)
         this.addToCache(event.id, event)
+        this.saveCacheToFile() 
       }
 
       console.log(`💾 Loaded ${result.rows.length} events from database`)
@@ -550,6 +552,7 @@ class DistributedEventServer {
 
     // Добавляем в локальный кеш
     this.addToCache(event.id, event)
+    this.saveCacheToFile() 
 
     // Уведомляем пиров
     await this.notifyPeers('EVENT_CREATED', event)
@@ -685,6 +688,7 @@ class DistributedEventServer {
           await this.saveEventToDB(event)  // ← ИСПРАВЬ: было updatedEvent
         }
         this.addToCache(event.id, event)
+        this.saveCacheToFile() 
 
         // Уведомляем клиентов
         this.broadcastToClients(existing ? 'EVENT_UPDATED' : 'EVENT_CREATED', event)
