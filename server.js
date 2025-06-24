@@ -479,7 +479,7 @@ class DistributedEventServer {
     }
 
     // Сохраняем в базу данных
-    await this.saveEventToDB(event)
+  //await this.saveEventToDB(event)
 
     // Добавляем в локальный кеш
     this.addToCache(event.id, event)
@@ -519,7 +519,11 @@ class DistributedEventServer {
     }
 
     // Сохраняем в базу
-    await this.saveEventToDB(updatedEvent)
+  //await this.saveEventToDB(updatedEvent)
+
+    if (process.env.DATABASE_URL !== 'disabled') {
+      await this.saveEventToDB(event)
+    }
 
     // Обновляем кеш
     this.addToCache(eventId, updatedEvent)
