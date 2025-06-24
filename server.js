@@ -38,6 +38,8 @@ class DistributedEventServer {
     this.maxCacheSize = 500 * 1024 * 1024 // 500MB в байтах
     this.currentCacheSize = 0
 
+    this.cacheFile = './events_cache.json'
+
     // Синхронизация
     this.lastSyncTime = 0
     this.syncInterval = 30000 // 30 секунд
@@ -295,11 +297,33 @@ class DistributedEventServer {
         }
         break
 
+      // ← ДОБАВЬ ЭТИ ОБРАБОТЧИКИ:
+      case 'UPDATE_EVENT':
+        try {
+          const { id, ...updates } = data
+          const event = await this.updateEvent(id, updates)
+          ws.send(JSON.stringify({ type: 'UPDATE_EVENT_SUCCESS', data: event }))
+        } catch (error) {
+          ws.send(JSON.stringify({ type: 'UPDATE_EVENT_ERROR', error: error.message }))
+        }
+        break
+
+      case 'DELETE_EVENT':
+        try {
+          const { id } = data
+          await this.deleteEvent(id)
+          ws.send(JSON.stringify({ type: 'DELETE_EVENT_SUCCESS', data: { id } }))
+        } catch (error) {
+          ws.send(JSON.stringify({ type: 'DELETE_EVENT_ERROR', error: error.message }))
+        }
+        break
+
       case 'LIKE_EVENT':
         try {
           const { id, isLiked } = data
           const event = await this.likeEvent(id, isLiked)
           this.broadcastToClients('EVENT_LIKED', { id, isLiked, likes: event.likes })
+          ws.send(JSON.stringify({ type: 'LIKE_EVENT_SUCCESS', data: event }))
         } catch (error) {
           ws.send(JSON.stringify({ type: 'LIKE_EVENT_ERROR', error: error.message }))
         }
@@ -398,12 +422,43 @@ class DistributedEventServer {
     }, 15000) // 15 секунд
   }
 
+  saveCacheToFile() {
+    try {
+      const cacheData = {
+        events: Array.from(this.localCache.values()),
+        timestamp: Date.now()
+      }
+      require('fs').writeFileSync(this.cacheFile, JSON.stringify(cacheData, null, 2))
+      console.log('💾 Cache saved to file')
+    } catch (error) {
+      console.error('Failed to save cache to file:', error)
+    }
+  }
+
+  loadCacheFromFile() {
+    try {
+      if (require('fs').existsSync(this.cacheFile)) {
+        const cacheData = JSON.parse(require('fs').readFileSync(this.cacheFile, 'utf8'))
+        const events = cacheData.events || []
+
+        for (const event of events) {
+          this.addToCache(event.id, event)
+        }
+
+        console.log(`💾 Loaded ${events.length} events from file`)
+      }
+    } catch (error) {
+      console.error('Failed to load cache from file:', error)
+    }
+  }
+
   // === УПРАВЛЕНИЕ КЕШЕМ ===
 
   async loadCacheFromDatabase() {
     try {
       if (!this.db) {
         console.log('💾 Database disabled - cache will start empty')
+        this.loadCacheFromFile()
         return
       }
 
@@ -515,8 +570,9 @@ class DistributedEventServer {
     let event = this.localCache.get(eventId)
 
     if (!event) {
-      // Загружаем из базы если нет в кеше
-      event = await this.loadEventFromDB(eventId)
+      if (this.db) {
+        event = await this.loadEventFromDB(eventId)
+      }
       if (!event) {
         throw new Error('Event not found')
       }
@@ -530,18 +586,9 @@ class DistributedEventServer {
       version: event.version + 1
     }
 
-    // Сохраняем в базу
-    //await this.saveEventToDB(updatedEvent)
-
-    if (process.env.DATABASE_URL && process.env.DATABASE_URL !== 'disabled') {
-      this.db = new Pool({
-        connectionString: process.env.DATABASE_URL,
-        ssl: process.env.NODE_ENV === 'production',
-        max: 3
-      })
-    } else {
-      this.db = null
-      console.log('📝 Database disabled - running in memory-only mode')
+    // Сохраняем в базу если есть
+    if (this.db) {
+      await this.saveEventToDB(updatedEvent)
     }
 
     // Обновляем кеш
@@ -635,7 +682,7 @@ class DistributedEventServer {
       if (!existing || existing.version < event.version) {
         // Новое событие или более новая версия
         if (this.db) {
-          await this.saveEventToDB(updatedEvent)
+          await this.saveEventToDB(event)  // ← ИСПРАВЬ: было updatedEvent
         }
         this.addToCache(event.id, event)
 
