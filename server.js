@@ -96,8 +96,10 @@ class DistributedEventServer {
     this.setupWebSocket()
     this.setupPeerToPeer()
     
-    await this.initializeDatabase()
-    await this.loadCacheFromDatabase()
+    if (this.db) {
+      await this.initializeDatabase()
+      await this.loadCacheFromDatabase()
+    }
     await this.startLeaderElection()
     this.startPeriodicTasks()
     
@@ -521,8 +523,15 @@ class DistributedEventServer {
     // Сохраняем в базу
   //await this.saveEventToDB(updatedEvent)
 
-    if (process.env.DATABASE_URL !== 'disabled') {
-      await this.saveEventToDB(event)
+    if (process.env.DATABASE_URL && process.env.DATABASE_URL !== 'disabled') {
+      this.db = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: process.env.NODE_ENV === 'production',
+        max: 3
+      })
+    } else {
+      this.db = null
+      console.log('📝 Database disabled - running in memory-only mode')
     }
 
     // Обновляем кеш
@@ -612,7 +621,9 @@ class DistributedEventServer {
       
       if (!existing || existing.version < event.version) {
         // Новое событие или более новая версия
-        await this.saveEventToDB(event)
+        if (this.db) {
+          await this.saveEventToDB(updatedEvent)
+        }
         this.addToCache(event.id, event)
         
         // Уведомляем клиентов
