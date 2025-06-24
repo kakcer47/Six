@@ -106,6 +106,8 @@ class DistributedEventServer {
     if (this.db) {
       await this.initializeDatabase()
       await this.loadCacheFromDatabase()
+    } else {
+      this.loadCacheFromFile()
     }
     await this.startLeaderElection()
     this.startPeriodicTasks()
@@ -143,8 +145,20 @@ class DistributedEventServer {
     // Получить ленту событий
     this.app.get('/api/feed', async (req, res) => {
       try {
-        const { page = 1, limit = 20, search, city, category } = req.query
-        const events = await this.getEventsFromCache({ page, limit, search, city, category })
+        const { page = 1, limit = 20, search, city, category, authorId } = req.query
+
+        console.log(`📡 Feed request: page=${page}, events in cache=${this.localCache.size}`) // ← ДОБАВЬ ЛОГИ
+
+        const events = await this.getEventsFromCache({
+          page: parseInt(page),
+          limit: parseInt(limit),
+          search,
+          city,
+          category,
+          authorId  // ← ДОБАВЬ authorId
+        })
+
+        console.log(`📡 Returning ${events.length} events`) // ← ДОБАВЬ ЛОГИ
 
         res.json({
           posts: events,
@@ -441,12 +455,18 @@ class DistributedEventServer {
         const cacheData = JSON.parse(require('fs').readFileSync(this.cacheFile, 'utf8'))
         const events = cacheData.events || []
 
+        // Очищаем кеш перед загрузкой
+        this.localCache.clear()
+        this.cacheMetadata.clear()
+        this.currentCacheSize = 0
+
         for (const event of events) {
           this.addToCache(event.id, event)
-          this.saveCacheToFile() 
         }
 
-        console.log(`💾 Loaded ${events.length} events from file`)
+        console.log(`💾 Loaded ${events.length} events from file cache`)
+      } else {
+        console.log('💾 No cache file found, starting with empty cache')
       }
     } catch (error) {
       console.error('Failed to load cache from file:', error)
@@ -473,7 +493,7 @@ class DistributedEventServer {
       for (const row of result.rows) {
         const event = this.formatEventFromDB(row)
         this.addToCache(event.id, event)
-        this.saveCacheToFile() 
+        this.saveCacheToFile()
       }
 
       console.log(`💾 Loaded ${result.rows.length} events from database`)
@@ -552,7 +572,7 @@ class DistributedEventServer {
 
     // Добавляем в локальный кеш
     this.addToCache(event.id, event)
-    this.saveCacheToFile() 
+    this.saveCacheToFile()
 
     // Уведомляем пиров
     await this.notifyPeers('EVENT_CREATED', event)
@@ -688,7 +708,7 @@ class DistributedEventServer {
           await this.saveEventToDB(event)  // ← ИСПРАВЬ: было updatedEvent
         }
         this.addToCache(event.id, event)
-        this.saveCacheToFile() 
+        this.saveCacheToFile()
 
         // Уведомляем клиентов
         this.broadcastToClients(existing ? 'EVENT_UPDATED' : 'EVENT_CREATED', event)
@@ -811,33 +831,52 @@ class DistributedEventServer {
 
   // === ПОИСК И ФИЛЬТРАЦИЯ ===
 
-  async getEventsFromCache({ page, limit, search, city, category }) {
+  async getEventsFromCache({ page, limit, search, city, category, authorId }) {
+    console.log(`🔍 getEventsFromCache called: cache size=${this.localCache.size}`)
+
     let events = Array.from(this.localCache.values())
       .filter(event => event.status === 'active')
 
-    // Фильтрация
+    console.log(`🔍 Active events: ${events.length}`)
+
+    // Фильтрация по автору
+    if (authorId) {
+      events = events.filter(event => event.authorId === authorId)
+      console.log(`🔍 After authorId filter: ${events.length}`)
+    }
+
+    // Фильтрация по поиску
     if (search) {
       const searchLower = search.toLowerCase()
       events = events.filter(event =>
         event.title.toLowerCase().includes(searchLower) ||
         event.description.toLowerCase().includes(searchLower)
       )
+      console.log(`🔍 After search filter: ${events.length}`)
     }
 
+    // Фильтрация по городу
     if (city) {
       events = events.filter(event => event.city === city)
+      console.log(`🔍 After city filter: ${events.length}`)
     }
 
+    // Фильтрация по категории
     if (category) {
       events = events.filter(event => event.category === category)
+      console.log(`🔍 After category filter: ${events.length}`)
     }
 
-    // Сортировка по дате создания
+    // Сортировка по дате создания (новые первые)
     events.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
 
     // Пагинация
     const offset = (page - 1) * limit
-    return events.slice(offset, offset + limit)
+    const result = events.slice(offset, offset + limit)
+
+    console.log(`🔍 Final result: ${result.length} events (offset=${offset}, limit=${limit})`)
+
+    return result
   }
 
   // === ANTI-SLEEP И МОНИТОРИНГ ===
