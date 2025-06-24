@@ -107,7 +107,9 @@ class DistributedEventServer {
       await this.initializeDatabase()
       await this.loadCacheFromDatabase()
     } else {
+      console.log('📝 Database disabled - loading from file cache')
       this.loadCacheFromFile()
+      console.log(`💾 Cache loaded, size: ${this.localCache.size}`)
     }
     await this.startLeaderElection()
     this.startPeriodicTasks()
@@ -147,7 +149,16 @@ class DistributedEventServer {
       try {
         const { page = 1, limit = 20, search, city, category, authorId } = req.query
 
-        console.log(`📡 Feed request: page=${page}, events in cache=${this.localCache.size}`) // ← ДОБАВЬ ЛОГИ
+        console.log(`📡 === FEED REQUEST ===`)
+        console.log(`📡 Cache size: ${this.localCache.size}`)
+        console.log(`📡 Request params:`, { page, limit, search, city, category, authorId })
+
+        // ← ДОБАВЬ ПРОВЕРКУ КЕША
+        if (this.localCache.size === 0) {
+          console.log(`⚠️ Cache is empty! Trying to reload from file...`)
+          this.loadCacheFromFile()
+          console.log(`📡 After reload, cache size: ${this.localCache.size}`)
+        }
 
         const events = await this.getEventsFromCache({
           page: parseInt(page),
@@ -155,10 +166,11 @@ class DistributedEventServer {
           search,
           city,
           category,
-          authorId  // ← ДОБАВЬ authorId
+          authorId
         })
 
-        console.log(`📡 Returning ${events.length} events`) // ← ДОБАВЬ ЛОГИ
+        console.log(`📡 Returning ${events.length} events`)
+        console.log(`📡 Event titles:`, events.map(e => e.title))
 
         res.json({
           posts: events,
@@ -572,7 +584,11 @@ class DistributedEventServer {
 
     // Добавляем в локальный кеш
     this.addToCache(event.id, event)
-    this.saveCacheToFile()
+
+    setTimeout(() => {
+      this.saveCacheToFile()
+      console.log(`💾 Cache saved after creating: ${event.title}`)
+    }, 100)
 
     // Уведомляем пиров
     await this.notifyPeers('EVENT_CREATED', event)
