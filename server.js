@@ -70,11 +70,16 @@ class DistributedEventServer {
     this.wss = new WebSocket.Server({ server: this.server })
 
     // 2. База данных (общая для всех серверов)
-    this.db = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: process.env.NODE_ENV === 'production',
-      max: 3 // Ограничиваем соединения
-    })
+    if (process.env.DATABASE_URL && process.env.DATABASE_URL !== 'disabled') {
+      this.db = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: process.env.NODE_ENV === 'production',
+        max: 3
+      })
+    } else {
+      this.db = null
+      console.log('📝 Database disabled - running in memory-only mode')
+    }
 
     // 3. Redis для pub/sub между серверами (опционально)
     if (process.env.REDIS_URL) {
