@@ -25,24 +25,24 @@ class DistributedEventServer {
     this.serverId = process.env.SERVER_ID || `server_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
     this.region = process.env.REGION || 'US'
     this.port = process.env.PORT || 3000
-    
+
     // Peer-to-peer конфигурация
     this.peers = this.parsePeers(process.env.PEER_SERVERS || '')
     this.isLeader = false
     this.lastLeaderPing = Date.now()
     this.leaderTimeout = 30000 // 30 секунд
-    
+
     // Локальный кеш (500MB limit)
     this.localCache = new Map() // eventId -> event
     this.cacheMetadata = new Map() // eventId -> {timestamp, size, accessCount}
     this.maxCacheSize = 500 * 1024 * 1024 // 500MB в байтах
     this.currentCacheSize = 0
-    
+
     // Синхронизация
     this.lastSyncTime = 0
     this.syncInterval = 30000 // 30 секунд
     this.conflictResolution = 'last_write_wins' // или 'vector_clocks'
-    
+
     this.initializeServices()
   }
 
@@ -51,7 +51,7 @@ class DistributedEventServer {
      * Парсит строку пиров вида: "server1.com:3000,server2.com:3000"
      */
     if (!peerString) return []
-    
+
     return peerString.split(',').map(peer => {
       const [host, port] = peer.trim().split(':')
       return { host, port: parseInt(port) || 3000, id: `${host}_${port}` }
@@ -100,14 +100,14 @@ class DistributedEventServer {
     this.setupRoutes()
     this.setupWebSocket()
     this.setupPeerToPeer()
-    
+
     if (this.db) {
       await this.initializeDatabase()
       await this.loadCacheFromDatabase()
     }
     await this.startLeaderElection()
     this.startPeriodicTasks()
-    
+
     this.server.listen(this.port, () => {
       console.log(`🚀 Distributed Server [${this.serverId}] running on port ${this.port}`)
       console.log(`📍 Region: ${this.region}`)
@@ -119,7 +119,7 @@ class DistributedEventServer {
   setupMiddleware() {
     this.app.use(cors())
     this.app.use(express.json({ limit: '10mb' }))
-    
+
     // Health check
     this.app.get('/health', (req, res) => {
       res.json({
@@ -137,13 +137,13 @@ class DistributedEventServer {
 
   setupRoutes() {
     // === API для фронтенда ===
-    
+
     // Получить ленту событий
     this.app.get('/api/feed', async (req, res) => {
       try {
         const { page = 1, limit = 20, search, city, category } = req.query
         const events = await this.getEventsFromCache({ page, limit, search, city, category })
-        
+
         res.json({
           posts: events,
           hasMore: events.length === parseInt(limit),
@@ -194,13 +194,13 @@ class DistributedEventServer {
     })
 
     // === API для peer-to-peer синхронизации ===
-    
+
     // Получить события для синхронизации
     this.app.get('/api/sync/events', this.authenticatePeer.bind(this), async (req, res) => {
       try {
         const { since, limit = 100 } = req.query
         const events = this.getEventsForSync(since, limit)
-        
+
         res.json({
           events,
           serverId: this.serverId,
@@ -217,11 +217,11 @@ class DistributedEventServer {
       try {
         const { events, fromServerId, timestamp } = req.body
         await this.receiveSyncEvents(events, fromServerId, timestamp)
-        
-        res.json({ 
-          success: true, 
+
+        res.json({
+          success: true,
           receivedCount: events.length,
-          serverId: this.serverId 
+          serverId: this.serverId
         })
       } catch (error) {
         console.error('Receive sync error:', error)
@@ -232,7 +232,7 @@ class DistributedEventServer {
     // Пинг от другого сервера
     this.app.post('/api/peer/ping', this.authenticatePeer.bind(this), (req, res) => {
       const { fromServerId, isLeader } = req.body
-      
+
       if (isLeader) {
         this.lastLeaderPing = Date.now()
         if (this.isLeader && fromServerId !== this.serverId) {
@@ -253,11 +253,11 @@ class DistributedEventServer {
     // Простая аутентификация пиров (в продакшене - JWT или подписи)
     const peerToken = req.headers['x-peer-token']
     const expectedToken = process.env.PEER_TOKEN || 'default_peer_token'
-    
+
     if (peerToken !== expectedToken) {
       return res.status(401).json({ error: 'Unauthorized peer' })
     }
-    
+
     next()
   }
 
@@ -337,7 +337,7 @@ class DistributedEventServer {
     // Простой алгоритм выбора лидера - сервер с наименьшим ID
     const allServerIds = [this.serverId, ...this.peers.map(p => p.id)].sort()
     const shouldBeLeader = allServerIds[0] === this.serverId
-    
+
     if (shouldBeLeader && !this.isLeader) {
       console.log(`👑 ${this.serverId} elected as leader`)
       this.isLeader = true
@@ -402,6 +402,11 @@ class DistributedEventServer {
 
   async loadCacheFromDatabase() {
     try {
+      if (!this.db) {
+        console.log('💾 Database disabled - cache will start empty')
+        return
+      }
+
       const result = await this.db.query(`
         SELECT * FROM events 
         WHERE status = 'active' 
@@ -422,7 +427,7 @@ class DistributedEventServer {
 
   addToCache(eventId, event) {
     const eventSize = this.calculateEventSize(event)
-    
+
     // Проверяем лимит кеша
     if (this.currentCacheSize + eventSize > this.maxCacheSize) {
       this.evictLRUEvents(eventSize)
@@ -486,7 +491,7 @@ class DistributedEventServer {
     }
 
     // Сохраняем в базу данных
-  //await this.saveEventToDB(event)
+    //await this.saveEventToDB(event)
 
     // Добавляем в локальный кеш
     this.addToCache(event.id, event)
@@ -508,7 +513,7 @@ class DistributedEventServer {
 
   async updateEvent(eventId, updates) {
     let event = this.localCache.get(eventId)
-    
+
     if (!event) {
       // Загружаем из базы если нет в кеше
       event = await this.loadEventFromDB(eventId)
@@ -526,7 +531,7 @@ class DistributedEventServer {
     }
 
     // Сохраняем в базу
-  //await this.saveEventToDB(updatedEvent)
+    //await this.saveEventToDB(updatedEvent)
 
     if (process.env.DATABASE_URL && process.env.DATABASE_URL !== 'disabled') {
       this.db = new Pool({
@@ -552,8 +557,9 @@ class DistributedEventServer {
   }
 
   async deleteEvent(eventId) {
-    // Помечаем как удаленное в базе
-    await this.db.query('UPDATE events SET status = $1 WHERE id = $2', ['deleted', eventId])
+    if (this.db) {
+      await this.db.query('UPDATE events SET status = $1 WHERE id = $2', ['deleted', eventId])
+    }
 
     // Удаляем из кеша
     if (this.localCache.has(eventId)) {
@@ -572,16 +578,18 @@ class DistributedEventServer {
 
   async likeEvent(eventId, isLiked) {
     let event = this.localCache.get(eventId)
-    
+
     if (!event) {
-      event = await this.loadEventFromDB(eventId)
+      if (this.db) {
+        event = await this.loadEventFromDB(eventId)
+      }
       if (!event) {
         throw new Error('Event not found')
       }
     }
 
     const newLikes = isLiked ? event.likes + 1 : Math.max(0, event.likes - 1)
-    
+
     return await this.updateEvent(eventId, { likes: newLikes })
   }
 
@@ -623,14 +631,14 @@ class DistributedEventServer {
   async receiveSyncEvents(events, fromServerId, timestamp) {
     for (const event of events) {
       const existing = this.localCache.get(event.id)
-      
+
       if (!existing || existing.version < event.version) {
         // Новое событие или более новая версия
         if (this.db) {
           await this.saveEventToDB(updatedEvent)
         }
         this.addToCache(event.id, event)
-        
+
         // Уведомляем клиентов
         this.broadcastToClients(existing ? 'EVENT_UPDATED' : 'EVENT_CREATED', event)
       }
@@ -662,7 +670,7 @@ class DistributedEventServer {
 
   handlePeerNotification(notification) {
     const { type, data, fromServerId } = notification
-    
+
     if (fromServerId === this.serverId) return // Игнорируем свои уведомления
 
     // Обрабатываем уведомление от пира
@@ -672,7 +680,7 @@ class DistributedEventServer {
         this.addToCache(data.id, data)
         this.broadcastToClients(type, data)
         break
-        
+
       case 'EVENT_DELETED':
         if (this.localCache.has(data.id)) {
           const metadata = this.cacheMetadata.get(data.id)
@@ -721,7 +729,7 @@ class DistributedEventServer {
         city = $6, category = $7, likes = $8, updated_at = $10, 
         status = $11, server_id = $12, version = $13
     `, [
-      event.id, event.title, event.description, event.authorId, 
+      event.id, event.title, event.description, event.authorId,
       event.author.fullName, event.city, event.category, event.likes,
       event.createdAt, event.updatedAt, event.status, event.serverId, event.version
     ])
@@ -759,7 +767,7 @@ class DistributedEventServer {
     // Фильтрация
     if (search) {
       const searchLower = search.toLowerCase()
-      events = events.filter(event => 
+      events = events.filter(event =>
         event.title.toLowerCase().includes(searchLower) ||
         event.description.toLowerCase().includes(searchLower)
       )
@@ -809,7 +817,7 @@ class DistributedEventServer {
   async pingPeer(peer, isLeader = false) {
     const response = await fetch(`http://${peer.host}:${peer.port}/api/peer/ping`, {
       method: 'POST',
-      headers: { 
+      headers: {
         'Content-Type': 'application/json',
         'x-peer-token': process.env.PEER_TOKEN || 'default_peer_token'
       },
@@ -828,7 +836,7 @@ class DistributedEventServer {
     if (!this.telegramBot || !this.telegramGroupId) return
 
     const message = `🎯 ${event.title}\n\n${event.description}\n\n📍 ${event.city}\n👤 ${event.author.fullName}`
-    
+
     try {
       await this.telegramBot.sendMessage(this.telegramGroupId, message)
       console.log(`📤 Sent to Telegram: ${event.title}`)
@@ -839,7 +847,7 @@ class DistributedEventServer {
 
   cleanupCache() {
     const targetSize = this.maxCacheSize * 0.8 // Очищаем до 80% от лимита
-    
+
     if (this.currentCacheSize > targetSize) {
       const neededSpace = this.currentCacheSize - targetSize
       this.evictLRUEvents(neededSpace)
