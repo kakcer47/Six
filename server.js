@@ -644,7 +644,7 @@ ${event.description}
         isLiked: false,
         createdAt: new Date(message.date * 1000).toISOString(),
         updatedAt: new Date(message.date * 1000).toISOString(),
-        status: 'active' as const
+        status: 'active'
       }
 
       console.log('✅ Parsed event:', event)
