@@ -1,15 +1,14 @@
 #!/usr/bin/env node
 /**
- * Production Events Server with Telegram Moderation
- * =================================================
+ * Telegram Events Proxy Server
+ * =============================
  * 
- * Architecture:
- * Frontend → Server+Bot → Group1(moderation) → Group2(publication) → Webhook → WebSocket broadcast
+ * Архитектура: Сервер-прокси без хранения данных
+ * Frontend → Server → Telegram Groups → Real-time response
  * 
- * Deployment: Render.com
- * Groups: 
- * - Moderation: -1002268255207
- * - Publication: -1002361596586
+ * Группы:
+ * - Модерация: -1002268255207
+ * - Публикация: -1002361596586
  */
 
 const express = require('express')
@@ -17,10 +16,8 @@ const http = require('http')
 const WebSocket = require('ws')
 const TelegramBot = require('node-telegram-bot-api')
 const cors = require('cors')
-const crypto = require('crypto')
-const fs = require('fs')
 
-class ProductionEventServer {
+class TelegramEventsProxy {
   constructor() {
     // Configuration
     this.BOT_TOKEN = process.env.BOT_TOKEN || "8059706275:AAGZGLnZfP_WvJQcqOdfRqFEJwWUF0kvmgM"
@@ -38,57 +35,44 @@ class ProductionEventServer {
     // Telegram Bot
     this.bot = new TelegramBot(this.BOT_TOKEN)
 
-    // Storage
-    this.events = new Map() // eventId -> event
-    this.pendingEvents = new Map() // eventId -> event (waiting moderation)
+    // WebSocket clients only
     this.wsClients = new Set()
-    this.cacheFile = './events_cache.json'
 
-    // Statistics
-    this.stats = {
-      totalEvents: 0,
-      pendingModeration: 0,
-      approvedEvents: 0,
-      connectedClients: 0,
-      startTime: new Date().toISOString()
-    }
+    // Temporary storage for pending events (for moderation flow only)
+    this.tempPendingEvents = new Map()
 
     this.initialize()
   }
 
   async initialize() {
-    console.log('🚀 Initializing Production Event Server...')
+    console.log('🚀 Initializing Telegram Events Proxy...')
     console.log(`📱 Bot Token: ${this.BOT_TOKEN.substring(0, 10)}...`)
     console.log(`📋 Moderation Group: ${this.MODERATION_GROUP}`)
     console.log(`📢 Publication Group: ${this.PUBLICATION_GROUP}`)
-    console.log(`🌐 Render URL: ${this.RENDER_URL}`)
+    console.log(`🌐 Server URL: ${this.RENDER_URL}`)
 
     await this.setupMiddleware()
     await this.setupRoutes()
     await this.setupWebSocket()
     await this.setupTelegramBot()
-    await this.loadCache()
     await this.setupWebhook()
     await this.startServer()
   }
 
   setupMiddleware() {
-    // ИСПРАВЛЕННЫЙ CORS - разрешаем ВСЕ origins для продакшна
     this.app.use(cors({
-      origin: true, // Разрешаем все домены
+      origin: true,
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
       allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'User-Agent'],
       exposedHeaders: ['Content-Length', 'X-Request-ID']
     }))
 
-    // Дополнительные CORS заголовки
     this.app.use((req, res, next) => {
       res.header('Access-Control-Allow-Origin', '*')
       res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
       res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Content-Length, X-Requested-With, User-Agent')
-
-      // Обработка preflight запросов
+      
       if (req.method === 'OPTIONS') {
         res.status(200).send()
         return
@@ -98,13 +82,9 @@ class ProductionEventServer {
 
     this.app.use(express.json({ limit: '10mb' }))
 
-    // Request logging с деталями
+    // Request logging
     this.app.use((req, res, next) => {
       console.log(`📡 ${req.method} ${req.path} - ${req.ip}`)
-      console.log(`📡 Headers:`, req.headers.origin, req.headers['user-agent'])
-      if (req.body && Object.keys(req.body).length > 0) {
-        console.log(`📡 Body:`, JSON.stringify(req.body).substring(0, 200))
-      }
       next()
     })
 
@@ -112,15 +92,10 @@ class ProductionEventServer {
     this.app.get('/health', (req, res) => {
       res.json({
         status: 'healthy',
-        server: 'production-events-server',
+        server: 'telegram-events-proxy',
         uptime: process.uptime(),
         memory: process.memoryUsage(),
-        stats: {
-          ...this.stats,
-          connectedClients: this.wsClients.size,
-          pendingModeration: this.pendingEvents.size,
-          approvedEvents: this.events.size
-        },
+        clients: this.wsClients.size,
         timestamp: new Date().toISOString()
       })
     })
@@ -128,28 +103,60 @@ class ProductionEventServer {
 
   setupRoutes() {
     // ==========================================
-    // FRONTEND API
+    // REAL-TIME FEED FROM TELEGRAM GROUP
     // ==========================================
-
-    // Get events feed
-    this.app.get('/api/feed', (req, res) => {
+    this.app.get('/api/feed', async (req, res) => {
       try {
-        const { page = 1, limit = 20, search, city, category, authorId, view } = req.query
-        const events = this.getFilteredEvents({ page: parseInt(page), limit: parseInt(limit), search, city, category, authorId, view })
+        console.log('📖 Reading Telegram group in real-time...')
+
+        // Читаем группу прямо сейчас
+        const messages = await this.getGroupMessages()
+        const events = []
+
+        for (const message of messages) {
+          const event = this.parsePublicationMessage(message)
+          if (event) events.push(event)
+        }
+
+        // Фильтрация
+        const { search, city, category, page = 1, limit = 20 } = req.query
+        let filteredEvents = events
+
+        if (search) {
+          const searchLower = search.toLowerCase()
+          filteredEvents = filteredEvents.filter(event =>
+            event.title.toLowerCase().includes(searchLower) ||
+            event.description.toLowerCase().includes(searchLower)
+          )
+        }
+
+        if (city) filteredEvents = filteredEvents.filter(e => e.city === city)
+        if (category) filteredEvents = filteredEvents.filter(e => e.category === category)
+
+        // Сортировка по дате
+        filteredEvents.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+
+        // Пагинация
+        const offset = (parseInt(page) - 1) * parseInt(limit)
+        const paginatedEvents = filteredEvents.slice(offset, offset + parseInt(limit))
 
         res.json({
-          posts: events,
-          hasMore: events.length === parseInt(limit),
-          total: this.events.size,
-          server: 'production'
+          posts: paginatedEvents,
+          hasMore: paginatedEvents.length === parseInt(limit),
+          total: filteredEvents.length,
+          server: 'realtime-proxy'
         })
+
+        console.log(`📋 Sent ${paginatedEvents.length} events from ${events.length} total`)
       } catch (error) {
         console.error('❌ Feed error:', error)
         res.status(500).json({ error: 'Failed to fetch events' })
       }
     })
 
-    // Create event (goes to moderation)
+    // ==========================================
+    // CREATE EVENT (TO MODERATION)
+    // ==========================================
     this.app.post('/api/events', async (req, res) => {
       try {
         const eventData = req.body
@@ -161,63 +168,26 @@ class ProductionEventServer {
       }
     })
 
-    // Like event
-    this.app.post('/api/events/:id/like', (req, res) => {
-      try {
-        const { id } = req.params
-        const { isLiked } = req.body
-
-        const event = this.events.get(id)
-        if (!event) {
-          return res.status(404).json({ error: 'Event not found' })
-        }
-
-        event.likes += isLiked ? 1 : -1
-        event.likes = Math.max(0, event.likes)
-        event.updatedAt = new Date().toISOString()
-
-        this.saveCache()
-        this.broadcastToClients('EVENT_LIKED', { id, isLiked, likes: event.likes })
-
-        res.json({ success: true, likes: event.likes })
-      } catch (error) {
-        console.error('❌ Like error:', error)
-        res.status(500).json({ error: 'Failed to like event' })
-      }
-    })
-
-    // Update event (WebSocket only, but keep endpoint for compatibility)
-    this.app.put('/api/events/:id', (req, res) => {
-      res.json({ error: 'Use WebSocket for real-time updates' })
-    })
-
-    // Delete event (WebSocket only)
-    this.app.delete('/api/events/:id', (req, res) => {
-      res.json({ error: 'Use WebSocket for real-time updates' })
-    })
-
     // ==========================================
     // TELEGRAM WEBHOOK
     // ==========================================
-
     this.app.post('/webhook', async (req, res) => {
       try {
         const update = req.body
         console.log('🔔 WEBHOOK RECEIVED:', JSON.stringify(update, null, 2))
 
-        // Обработка callback_query (кнопки модерации)
+        // Обработка кнопок модерации
         if (update.callback_query) {
           console.log('🔘 Processing callback_query...')
           await this.handleModerationAction(update.callback_query)
         }
 
-        // Обработка сообщений в группе публикаций
+        // Обработка новых сообщений в группе публикаций
         if (update.message && update.message.chat.id.toString() === this.PUBLICATION_GROUP) {
           console.log('📢 Processing publication group message...')
           await this.handlePublicationGroupMessage(update.message)
         }
 
-        // Обработка channel_post (если события публикуются как channel posts)
         if (update.channel_post && update.channel_post.chat.id.toString() === this.PUBLICATION_GROUP) {
           console.log('📺 Processing publication channel post...')
           await this.handlePublicationGroupMessage(update.channel_post)
@@ -231,25 +201,8 @@ class ProductionEventServer {
     })
 
     // ==========================================
-    // ADMIN ENDPOINTS
+    // ADMIN
     // ==========================================
-
-    this.app.get('/admin/stats', (req, res) => {
-      res.json({
-        ...this.stats,
-        events: this.events.size,
-        pending: this.pendingEvents.size,
-        clients: this.wsClients.size,
-        memoryUsage: process.memoryUsage(),
-        uptime: process.uptime()
-      })
-    })
-
-    this.app.get('/admin/events', (req, res) => {
-      const events = Array.from(this.events.values()).slice(0, 50)
-      res.json({ total: this.events.size, events })
-    })
-
     this.app.post('/admin/broadcast', (req, res) => {
       const { message } = req.body
       this.broadcastToClients('ADMIN_MESSAGE', { message, timestamp: new Date().toISOString() })
@@ -260,15 +213,13 @@ class ProductionEventServer {
   setupWebSocket() {
     this.wss.on('connection', (ws, req) => {
       this.wsClients.add(ws)
-      this.stats.connectedClients = this.wsClients.size
       console.log(`📡 Client connected from ${req.socket.remoteAddress} (${this.wsClients.size} total)`)
 
-      // Send welcome message
+      // Welcome message
       ws.send(JSON.stringify({
         type: 'CONNECTED',
         data: {
-          server: 'production',
-          eventsCount: this.events.size,
+          server: 'telegram-proxy',
           timestamp: new Date().toISOString()
         }
       }))
@@ -285,7 +236,6 @@ class ProductionEventServer {
 
       ws.on('close', () => {
         this.wsClients.delete(ws)
-        this.stats.connectedClients = this.wsClients.size
         console.log(`📡 Client disconnected (${this.wsClients.size} remaining)`)
       })
 
@@ -312,47 +262,6 @@ class ProductionEventServer {
         }
         break
 
-      case 'UPDATE_EVENT':
-        if (data.id && this.events.has(data.id)) {
-          const event = this.events.get(data.id)
-          Object.assign(event, data.updates, { updatedAt: new Date().toISOString() })
-          this.saveCache()
-          this.broadcastToClients('EVENT_UPDATED', event)
-          ws.send(JSON.stringify({ type: 'UPDATE_EVENT_SUCCESS', data: event }))
-        } else {
-          ws.send(JSON.stringify({ type: 'UPDATE_EVENT_ERROR', error: 'Event not found' }))
-        }
-        break
-
-      case 'DELETE_EVENT':
-        if (data.id && this.events.has(data.id)) {
-          this.events.delete(data.id)
-          this.saveCache()
-          this.broadcastToClients('EVENT_DELETED', { id: data.id })
-          ws.send(JSON.stringify({ type: 'DELETE_EVENT_SUCCESS', data: { id: data.id } }))
-        } else {
-          ws.send(JSON.stringify({ type: 'DELETE_EVENT_ERROR', error: 'Event not found' }))
-        }
-        break
-
-      case 'LIKE_EVENT':
-        const event = this.events.get(data.id)
-        if (event) {
-          event.likes += data.isLiked ? 1 : -1
-          event.likes = Math.max(0, event.likes)
-          this.saveCache()
-          this.broadcastToClients('EVENT_LIKED', { id: data.id, isLiked: data.isLiked, likes: event.likes })
-          ws.send(JSON.stringify({ type: 'LIKE_EVENT_SUCCESS', data: { likes: event.likes } }))
-        } else {
-          ws.send(JSON.stringify({ type: 'LIKE_EVENT_ERROR', error: 'Event not found' }))
-        }
-        break
-
-      case 'GET_EVENTS':
-        const events = Array.from(this.events.values()).slice(0, 20)
-        ws.send(JSON.stringify({ type: 'EVENTS_LIST', data: events }))
-        break
-
       case 'PING':
         ws.send(JSON.stringify({ type: 'PONG', data: { timestamp: Date.now() } }))
         break
@@ -364,12 +273,9 @@ class ProductionEventServer {
   }
 
   async setupTelegramBot() {
-    // Handle moderation actions
     this.bot.on('callback_query', async (query) => {
       await this.handleModerationAction(query)
     })
-
-    // Set webhook for publication group
     console.log('🤖 Telegram bot configured')
   }
 
@@ -386,9 +292,85 @@ class ProductionEventServer {
   }
 
   // ==========================================
-  // EVENT CREATION & MODERATION
+  // TELEGRAM GROUP READING
   // ==========================================
+  async getGroupMessages() {
+    try {
+      const updates = await this.bot.getUpdates({ limit: 100 })
 
+      const messages = updates
+        .filter(update =>
+          (update.message && update.message.chat.id.toString() === this.PUBLICATION_GROUP) ||
+          (update.channel_post && update.channel_post.chat.id.toString() === this.PUBLICATION_GROUP)
+        )
+        .map(update => update.message || update.channel_post)
+        .filter(msg => msg.text && msg.text.includes('#event'))
+
+      console.log(`📨 Found ${messages.length} relevant messages in updates`)
+      return messages
+    } catch (error) {
+      console.error('❌ Failed to get group messages:', error)
+      return []
+    }
+  }
+
+  parsePublicationMessage(message) {
+    try {
+      const text = message.text
+
+      if (!text || !text.includes('#event')) {
+        return null
+      }
+
+      const lines = text.split('\n').filter(line => line.trim())
+
+      // Извлекаем данные
+      const title = lines[0]?.replace(/^🎯\s*/, '').trim()
+      const description = lines[1]?.trim()
+
+      // ID события
+      const lastLine = lines[lines.length - 1]
+      const idMatch = lastLine?.match(/#([a-z0-9_]+)$/)
+      const id = idMatch ? idMatch[1] : `auto_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+
+      // Метаданные
+      const authorLine = lines.find(line => line.startsWith('👤'))
+      const cityLine = lines.find(line => line.startsWith('📍'))
+      const categoryLine = lines.find(line => line.startsWith('📂'))
+
+      const event = {
+        id,
+        title: title || 'Событие',
+        description: description || 'Описание',
+        author: {
+          fullName: authorLine?.replace('👤 ', '').trim() || 'Unknown',
+          avatar: undefined,
+          username: undefined,
+          telegramId: undefined
+        },
+        authorId: `telegram_user_${message.from?.id || 'unknown'}`,
+        city: cityLine?.replace('📍 ', '').trim() || '',
+        category: categoryLine?.replace('📂 ', '').trim() || '',
+        gender: '',
+        ageGroup: '',
+        eventDate: '',
+        likes: 0,
+        isLiked: false,
+        createdAt: new Date(message.date * 1000).toISOString(),
+        updatedAt: new Date(message.date * 1000).toISOString(),
+        status: 'active'
+      }
+
+      return event
+    } catch (error) {
+      console.error('❌ Parse error:', error)
+      return null
+    }
+  }
+
+  // ==========================================
+  // MODERATION FLOW
+  // ==========================================
   async createEventForModeration(eventData) {
     const event = {
       id: `evt_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -398,15 +380,15 @@ class ProductionEventServer {
       author: eventData.author || { fullName: 'Анонимный' },
       city: eventData.city || '',
       category: eventData.category || '',
-      likes: 0,
+      gender: eventData.gender || '',
+      ageGroup: eventData.ageGroup || '',
+      eventDate: eventData.eventDate || '',
       createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
       status: 'pending'
     }
 
-    this.pendingEvents.set(event.id, event)
-    this.stats.totalEvents++
-    this.stats.pendingModeration++
+    // Временно сохраняем для процесса модерации
+    this.tempPendingEvents.set(event.id, event)
 
     await this.sendToModerationGroup(event)
 
@@ -456,7 +438,7 @@ ${event.description}
     const { data, from, message } = query
     const [action, eventId] = data.split('_', 2)
 
-    const event = this.pendingEvents.get(eventId)
+    const event = this.tempPendingEvents.get(eventId)
     if (!event) {
       await this.bot.answerCallbackQuery(query.id, { text: 'Событие не найдено' })
       return
@@ -477,30 +459,21 @@ ${event.description}
   }
 
   async approveEvent(event, moderator, moderationMessage) {
-    // Move from pending to approved
-    this.pendingEvents.delete(event.id)
-    event.status = 'approved'
-    this.events.set(event.id, event)
+    // Удаляем из временного хранения
+    this.tempPendingEvents.delete(event.id)
 
-    this.stats.pendingModeration--
-    this.stats.approvedEvents++
-    this.saveCache()
-
-    // Send to publication group
+    // Отправляем в группу публикаций
     await this.sendToPublicationGroup(event)
 
-    // Update moderation message
+    // Обновляем сообщение модерации
     await this.updateModerationMessage(moderationMessage, event, '✅ ОДОБРЕНО')
 
     console.log(`✅ Event approved: ${event.title} by ${moderator.username || moderator.first_name}`)
   }
 
   async rejectEvent(event, moderator, moderationMessage) {
-    this.pendingEvents.delete(event.id)
-    this.stats.pendingModeration--
-
+    this.tempPendingEvents.delete(event.id)
     await this.updateModerationMessage(moderationMessage, event, '❌ ОТКЛОНЕНО')
-
     console.log(`❌ Event rejected: ${event.title} by ${moderator.username || moderator.first_name}`)
   }
 
@@ -551,13 +524,12 @@ ${event.description}
     }
   }
 
+  // ==========================================
+  // REAL-TIME BROADCASTS
+  // ==========================================
   async handlePublicationGroupMessage(message) {
     try {
-      console.log('📥 Processing publication message:', {
-        messageId: message.message_id,
-        chatId: message.chat.id,
-        text: message.text?.substring(0, 100) + '...'
-      })
+      console.log('📥 Processing publication message for broadcast...')
 
       const event = this.parsePublicationMessage(message)
 
@@ -566,18 +538,7 @@ ${event.description}
         return
       }
 
-      // Проверяем, не существует ли уже такое событие
-      if (this.events.has(event.id)) {
-        console.log('⚠️ Event already exists:', event.id)
-        return
-      }
-
-      // Добавляем событие
-      this.events.set(event.id, event)
-      this.stats.approvedEvents++
-      this.saveCache()
-
-      console.log('🎉 New event added from publication group:', event.title, event.id)
+      console.log('🎉 New event detected, broadcasting:', event.title, event.id)
 
       // Отправляем broadcast всем подключенным клиентам
       this.broadcastToClients('EVENT_CREATED', event)
@@ -587,105 +548,6 @@ ${event.description}
     } catch (error) {
       console.error('❌ Failed to handle publication message:', error)
     }
-  }
-
-  parsePublicationMessage(message) {
-    try {
-      const text = message.text
-      console.log('🔍 Parsing message text:', text)
-
-      if (!text) {
-        console.log('❌ No text in message')
-        return null
-      }
-
-      // Ищем #event в тексте
-      if (!text.includes('#event')) {
-        console.log('❌ No #event hashtag found')
-        return null
-      }
-
-      const lines = text.split('\n').filter(line => line.trim())
-      console.log('📝 Message lines:', lines)
-
-      // Извлекаем заголовок (первая строка без emoji)
-      const title = lines[0]?.replace(/^🎯\s*/, '').trim()
-
-      // Извлекаем описание (вторая непустая строка)
-      const description = lines[1]?.trim()
-
-      // Извлекаем ID события из последней строки
-      const lastLine = lines[lines.length - 1]
-      const idMatch = lastLine?.match(/#([a-z0-9_]+)$/)
-      const id = idMatch ? idMatch[1] : `auto_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-
-      // Извлекаем метаданные
-      const authorLine = lines.find(line => line.startsWith('👤'))
-      const cityLine = lines.find(line => line.startsWith('📍'))
-      const categoryLine = lines.find(line => line.startsWith('📂'))
-
-      const event = {
-        id,
-        title: title || 'Событие',
-        description: description || 'Описание',
-        author: {
-          fullName: authorLine?.replace('👤 ', '').trim() || 'Unknown',
-          avatar: undefined,
-          username: undefined,
-          telegramId: undefined
-        },
-        authorId: `telegram_user_${message.from?.id || 'unknown'}`,
-        city: cityLine?.replace('📍 ', '').trim() || '',
-        category: categoryLine?.replace('📂 ', '').trim() || '',
-        gender: '',
-        ageGroup: '',
-        eventDate: '',
-        likes: 0,
-        isLiked: false,
-        createdAt: new Date(message.date * 1000).toISOString(),
-        updatedAt: new Date(message.date * 1000).toISOString(),
-        status: 'active'
-      }
-
-      console.log('✅ Parsed event:', event)
-      return event
-    } catch (error) {
-      console.error('❌ Parse error:', error)
-      return null
-    }
-  }
-
-  // ==========================================
-  // UTILITIES
-  // ==========================================
-
-  getFilteredEvents({ page, limit, search, city, category, authorId, view }) {
-    let events = Array.from(this.events.values()).filter(event => event.status === 'approved')
-
-    if (authorId) {
-      events = events.filter(event => event.authorId === authorId)
-    }
-
-    if (search) {
-      const searchLower = search.toLowerCase()
-      events = events.filter(event =>
-        event.title.toLowerCase().includes(searchLower) ||
-        event.description.toLowerCase().includes(searchLower)
-      )
-    }
-
-    if (city) {
-      events = events.filter(event => event.city === city)
-    }
-
-    if (category) {
-      events = events.filter(event => event.category === category)
-    }
-
-    events.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-
-    const offset = (page - 1) * limit
-    return events.slice(offset, offset + limit)
   }
 
   broadcastToClients(type, data) {
@@ -702,71 +564,37 @@ ${event.description}
     console.log(`📡 Broadcast ${type} to ${sentCount} clients`)
   }
 
-  saveCache() {
-    try {
-      const cacheData = {
-        events: Array.from(this.events.values()),
-        stats: this.stats,
-        timestamp: new Date().toISOString()
-      }
-      fs.writeFileSync(this.cacheFile, JSON.stringify(cacheData, null, 2))
-    } catch (error) {
-      console.error('❌ Failed to save cache:', error)
-    }
-  }
-
-  loadCache() {
-    try {
-      if (fs.existsSync(this.cacheFile)) {
-        const cacheData = JSON.parse(fs.readFileSync(this.cacheFile, 'utf8'))
-
-        for (const event of cacheData.events || []) {
-          this.events.set(event.id, event)
-        }
-
-        if (cacheData.stats) {
-          this.stats = { ...this.stats, ...cacheData.stats }
-        }
-
-        console.log(`💾 Loaded ${this.events.size} events from cache`)
-      }
-    } catch (error) {
-      console.error('❌ Failed to load cache:', error)
-    }
-  }
-
+  // ==========================================
+  // SERVER STARTUP
+  // ==========================================
   async startServer() {
     this.server.listen(this.PORT, () => {
-      console.log(`🚀 Production Event Server running on port ${this.PORT}`)
+      console.log(`🚀 Telegram Events Proxy running on port ${this.PORT}`)
       console.log(`🌐 Health check: ${this.RENDER_URL}/health`)
       console.log(`📡 WebSocket endpoint: ws://${this.RENDER_URL}`)
       console.log(`📞 Webhook: ${this.RENDER_URL}/webhook`)
-      console.log(`💾 Events in cache: ${this.events.size}`)
-      console.log(`⏳ Pending moderation: ${this.pendingEvents.size}`)
+      console.log(`🎯 Mode: Real-time proxy without storage`)
     })
   }
 }
 
 // ==========================================
-// PRODUCTION STARTUP
+// STARTUP
 // ==========================================
-
-const server = new ProductionEventServer()
+const server = new TelegramEventsProxy()
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('🛑 SIGTERM received, shutting down gracefully')
-  server.saveCache()
   process.exit(0)
 })
 
 process.on('SIGINT', () => {
   console.log('🛑 SIGINT received, shutting down gracefully')
-  server.saveCache()
   process.exit(0)
 })
 
 // Keep alive for Render
 setInterval(() => {
-  console.log(`💓 Server alive - Events: ${server.events.size}, Clients: ${server.wsClients.size}`)
+  console.log(`💓 Server alive - Clients: ${server.wsClients.size}, Temp pending: ${server.tempPendingEvents.size}`)
 }, 300000) // 5 minutes
