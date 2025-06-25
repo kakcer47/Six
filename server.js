@@ -73,15 +73,38 @@ class ProductionEventServer {
   }
 
   setupMiddleware() {
+    // ИСПРАВЛЕННЫЙ CORS - разрешаем ВСЕ origins для продакшна
     this.app.use(cors({
-      origin: ['https://telegram-events-phi.vercel.app', 'http://localhost:3000', 'http://localhost:5173'],
-      credentials: true
+      origin: true, // Разрешаем все домены
+      credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'User-Agent'],
+      exposedHeaders: ['Content-Length', 'X-Request-ID']
     }))
+
+    // Дополнительные CORS заголовки
+    this.app.use((req, res, next) => {
+      res.header('Access-Control-Allow-Origin', '*')
+      res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Content-Length, X-Requested-With, User-Agent')
+      
+      // Обработка preflight запросов
+      if (req.method === 'OPTIONS') {
+        res.status(200).send()
+        return
+      }
+      next()
+    })
+
     this.app.use(express.json({ limit: '10mb' }))
     
-    // Request logging
+    // Request logging с деталями
     this.app.use((req, res, next) => {
       console.log(`📡 ${req.method} ${req.path} - ${req.ip}`)
+      console.log(`📡 Headers:`, req.headers.origin, req.headers['user-agent'])
+      if (req.body && Object.keys(req.body).length > 0) {
+        console.log(`📡 Body:`, JSON.stringify(req.body).substring(0, 200))
+      }
       next()
     })
 
@@ -262,6 +285,18 @@ class ProductionEventServer {
     const { type, data } = message
 
     switch (type) {
+      case 'CREATE_EVENT':
+        try {
+          console.log('📝 WebSocket: Processing CREATE_EVENT...', data)
+          const result = await this.createEventForModeration(data)
+          ws.send(JSON.stringify({ type: 'CREATE_EVENT_SUCCESS', data: result }))
+          console.log('✅ WebSocket: CREATE_EVENT processed successfully')
+        } catch (error) {
+          console.error('❌ WebSocket: CREATE_EVENT failed:', error)
+          ws.send(JSON.stringify({ type: 'CREATE_EVENT_ERROR', error: error.message }))
+        }
+        break
+
       case 'UPDATE_EVENT':
         if (data.id && this.events.has(data.id)) {
           const event = this.events.get(data.id)
@@ -308,7 +343,8 @@ class ProductionEventServer {
         break
 
       default:
-        ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }))
+        console.log('❌ Unknown WebSocket message type:', type)
+        ws.send(JSON.stringify({ type: 'ERROR', error: `Unknown message type: ${type}` }))
     }
   }
 
