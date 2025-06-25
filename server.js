@@ -87,7 +87,7 @@ class ProductionEventServer {
       res.header('Access-Control-Allow-Origin', '*')
       res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
       res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Content-Length, X-Requested-With, User-Agent')
-      
+
       // Обработка preflight запросов
       if (req.method === 'OPTIONS') {
         res.status(200).send()
@@ -97,7 +97,7 @@ class ProductionEventServer {
     })
 
     this.app.use(express.json({ limit: '10mb' }))
-    
+
     // Request logging с деталями
     this.app.use((req, res, next) => {
       console.log(`📡 ${req.method} ${req.path} - ${req.ip}`)
@@ -136,7 +136,7 @@ class ProductionEventServer {
       try {
         const { page = 1, limit = 20, search, city, category, authorId, view } = req.query
         const events = this.getFilteredEvents({ page: parseInt(page), limit: parseInt(limit), search, city, category, authorId, view })
-        
+
         res.json({
           posts: events,
           hasMore: events.length === parseInt(limit),
@@ -166,7 +166,7 @@ class ProductionEventServer {
       try {
         const { id } = req.params
         const { isLiked } = req.body
-        
+
         const event = this.events.get(id)
         if (!event) {
           return res.status(404).json({ error: 'Event not found' })
@@ -200,12 +200,27 @@ class ProductionEventServer {
     // TELEGRAM WEBHOOK
     // ==========================================
 
-    this.app.post('/webhook/telegram', async (req, res) => {
+    this.app.post('/webhook', async (req, res) => {
       try {
         const update = req.body
-        
+        console.log('🔔 WEBHOOK RECEIVED:', JSON.stringify(update, null, 2))
+
+        // Обработка callback_query (кнопки модерации)
+        if (update.callback_query) {
+          console.log('🔘 Processing callback_query...')
+          await this.handleModerationAction(update.callback_query)
+        }
+
+        // Обработка сообщений в группе публикаций
         if (update.message && update.message.chat.id.toString() === this.PUBLICATION_GROUP) {
+          console.log('📢 Processing publication group message...')
           await this.handlePublicationGroupMessage(update.message)
+        }
+
+        // Обработка channel_post (если события публикуются как channel posts)
+        if (update.channel_post && update.channel_post.chat.id.toString() === this.PUBLICATION_GROUP) {
+          console.log('📺 Processing publication channel post...')
+          await this.handlePublicationGroupMessage(update.channel_post)
         }
 
         res.status(200).send('OK')
@@ -360,7 +375,7 @@ class ProductionEventServer {
 
   async setupWebhook() {
     try {
-      const webhookUrl = `${this.RENDER_URL}/webhook/telegram`
+      const webhookUrl = `${this.RENDER_URL}/webhook`
       await this.bot.setWebHook(webhookUrl, {
         secret_token: this.WEBHOOK_SECRET
       })
@@ -396,9 +411,9 @@ class ProductionEventServer {
     await this.sendToModerationGroup(event)
 
     console.log(`📝 Event sent for moderation: ${event.title} (${event.id})`)
-    return { 
-      success: true, 
-      eventId: event.id, 
+    return {
+      success: true,
+      eventId: event.id,
       status: 'pending_moderation',
       message: 'Событие отправлено на модерацию'
     }
@@ -440,7 +455,7 @@ ${event.description}
   async handleModerationAction(query) {
     const { data, from, message } = query
     const [action, eventId] = data.split('_', 2)
-    
+
     const event = this.pendingEvents.get(eventId)
     if (!event) {
       await this.bot.answerCallbackQuery(query.id, { text: 'Событие не найдено' })
@@ -466,7 +481,7 @@ ${event.description}
     this.pendingEvents.delete(event.id)
     event.status = 'approved'
     this.events.set(event.id, event)
-    
+
     this.stats.pendingModeration--
     this.stats.approvedEvents++
     this.saveCache()
@@ -538,48 +553,102 @@ ${event.description}
 
   async handlePublicationGroupMessage(message) {
     try {
+      console.log('📥 Processing publication message:', {
+        messageId: message.message_id,
+        chatId: message.chat.id,
+        text: message.text?.substring(0, 100) + '...'
+      })
+
       const event = this.parsePublicationMessage(message)
-      if (event && !this.events.has(event.id)) {
-        this.events.set(event.id, event)
-        this.saveCache()
-        this.broadcastToClients('EVENT_CREATED', event)
-        console.log(`📥 New event via webhook: ${event.title}`)
+
+      if (!event) {
+        console.log('❌ Failed to parse event from message')
+        return
       }
+
+      // Проверяем, не существует ли уже такое событие
+      if (this.events.has(event.id)) {
+        console.log('⚠️ Event already exists:', event.id)
+        return
+      }
+
+      // Добавляем событие
+      this.events.set(event.id, event)
+      this.stats.approvedEvents++
+      this.saveCache()
+
+      console.log('🎉 New event added from publication group:', event.title, event.id)
+
+      // Отправляем broadcast всем подключенным клиентам
+      this.broadcastToClients('EVENT_CREATED', event)
+
+      console.log('📡 Event broadcasted to', this.wsClients.size, 'clients')
+
     } catch (error) {
-      console.error('❌ Failed to parse publication message:', error)
+      console.error('❌ Failed to handle publication message:', error)
     }
   }
 
   parsePublicationMessage(message) {
     try {
       const text = message.text
-      if (!text || !text.includes('#event')) return null
+      console.log('🔍 Parsing message text:', text)
 
-      const idMatch = text.match(/#([a-z0-9_]+)$/m)
-      if (!idMatch) return null
+      if (!text) {
+        console.log('❌ No text in message')
+        return null
+      }
 
-      const id = idMatch[1]
+      // Ищем #event в тексте
+      if (!text.includes('#event')) {
+        console.log('❌ No #event hashtag found')
+        return null
+      }
+
       const lines = text.split('\n').filter(line => line.trim())
-      
-      const title = lines[0]?.replace('🎯 ', '').trim()
-      const description = lines[2]?.trim()
-      
+      console.log('📝 Message lines:', lines)
+
+      // Извлекаем заголовок (первая строка без emoji)
+      const title = lines[0]?.replace(/^🎯\s*/, '').trim()
+
+      // Извлекаем описание (вторая непустая строка)
+      const description = lines[1]?.trim()
+
+      // Извлекаем ID события из последней строки
+      const lastLine = lines[lines.length - 1]
+      const idMatch = lastLine?.match(/#([a-z0-9_]+)$/)
+      const id = idMatch ? idMatch[1] : `auto_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+
+      // Извлекаем метаданные
       const authorLine = lines.find(line => line.startsWith('👤'))
       const cityLine = lines.find(line => line.startsWith('📍'))
       const categoryLine = lines.find(line => line.startsWith('📂'))
 
-      return {
+      const event = {
         id,
-        title,
-        description,
-        author: { fullName: authorLine?.replace('👤 ', '') || 'Unknown' },
-        city: cityLine?.replace('📍 ', '') || '',
-        category: categoryLine?.replace('📂 ', '') || '',
+        title: title || 'Событие',
+        description: description || 'Описание',
+        author: {
+          fullName: authorLine?.replace('👤 ', '').trim() || 'Unknown',
+          avatar: undefined,
+          username: undefined,
+          telegramId: undefined
+        },
+        authorId: `telegram_user_${message.from?.id || 'unknown'}`,
+        city: cityLine?.replace('📍 ', '').trim() || '',
+        category: categoryLine?.replace('📂 ', '').trim() || '',
+        gender: '',
+        ageGroup: '',
+        eventDate: '',
         likes: 0,
+        isLiked: false,
         createdAt: new Date(message.date * 1000).toISOString(),
         updatedAt: new Date(message.date * 1000).toISOString(),
-        status: 'approved'
+        status: 'active' as const
       }
+
+      console.log('✅ Parsed event:', event)
+      return event
     } catch (error) {
       console.error('❌ Parse error:', error)
       return null
@@ -622,7 +691,7 @@ ${event.description}
   broadcastToClients(type, data) {
     const message = JSON.stringify({ type, data })
     let sentCount = 0
-    
+
     this.wsClients.forEach(client => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(message)
@@ -650,7 +719,7 @@ ${event.description}
     try {
       if (fs.existsSync(this.cacheFile)) {
         const cacheData = JSON.parse(fs.readFileSync(this.cacheFile, 'utf8'))
-        
+
         for (const event of cacheData.events || []) {
           this.events.set(event.id, event)
         }
@@ -671,7 +740,7 @@ ${event.description}
       console.log(`🚀 Production Event Server running on port ${this.PORT}`)
       console.log(`🌐 Health check: ${this.RENDER_URL}/health`)
       console.log(`📡 WebSocket endpoint: ws://${this.RENDER_URL}`)
-      console.log(`📞 Webhook: ${this.RENDER_URL}/webhook/telegram`)
+      console.log(`📞 Webhook: ${this.RENDER_URL}/webhook`)
       console.log(`💾 Events in cache: ${this.events.size}`)
       console.log(`⏳ Pending moderation: ${this.pendingEvents.size}`)
     })
