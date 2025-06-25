@@ -105,7 +105,7 @@ class ProductionEventServer {
       next()
     })
 
-    // Health check
+
     this.app.get('/health', (req, res) => {
       res.json({
         status: 'healthy',
@@ -116,11 +116,12 @@ class ProductionEventServer {
           ...this.stats,
           connectedClients: this.wsClients.size
         },
-        timestamp: new Date().toISOString()
+       timestamp: new Date().toISOString()
       })
     })
+  } 
 
-    setupRoutes() {
+  setupRoutes() {
       // ==========================================
       // FRONTEND API
       // ==========================================
