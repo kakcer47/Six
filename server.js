@@ -379,6 +379,14 @@ class PostsServer {
     }
   }
 
+  ALTER TABLE events ADD COLUMN IF NOT EXISTS gender TEXT DEFAULT '';
+  ALTER TABLE events ADD COLUMN IF NOT EXISTS age_group TEXT DEFAULT '';
+  ALTER TABLE events ADD COLUMN IF NOT EXISTS date_from DATE;
+  ALTER TABLE events ADD COLUMN IF NOT EXISTS date_to DATE;
+  ALTER TABLE events ADD COLUMN IF NOT EXISTS author_avatar TEXT DEFAULT '';
+  ALTER TABLE events ADD COLUMN IF NOT EXISTS author_username TEXT DEFAULT '';
+  ALTER TABLE events ADD COLUMN IF NOT EXISTS author_telegram_id BIGINT;
+
   async updateStats() {
     if (!this.db) {
       this.stats.totalEvents = this.memoryEvents?.size || 0
@@ -416,12 +424,13 @@ class PostsServer {
 
     if (this.db) {
       await this.db.query(`
-        INSERT INTO events (id, title, description, author_id, author_name, city, category, likes, created_at, updated_at, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-      `, [
+  INSERT INTO events (id, title, description, author_id, author_name, author_avatar, author_username, author_telegram_id, city, category, gender, age_group, date_from, date_to, likes, created_at, updated_at, status)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+`, [
         event.id, event.title, event.description, event.authorId,
-        event.authorName, event.city, event.category, event.likes,
-        event.createdAt, event.updatedAt, event.status
+        event.authorName, event.author?.avatar, event.author?.username, event.author?.telegramId,
+        event.city, event.category, event.gender, event.ageGroup, event.dateFrom, event.dateTo,
+        event.likes, event.createdAt, event.updatedAt, event.status
       ])
     } else {
       this.memoryEvents.set(event.id, event)
@@ -674,10 +683,17 @@ class PostsServer {
       description: row.description,
       authorId: row.author_id,
       author: {
-        fullName: row.author_name
+        fullName: row.author_name,
+        avatar: row.author_avatar,
+        username: row.author_username,
+        telegramId: row.author_telegram_id
       },
       city: row.city || '',
       category: row.category || '',
+      gender: row.gender || '',
+      ageGroup: row.age_group || '',
+      dateFrom: row.date_from,
+      dateTo: row.date_to,
       likes: row.likes || 0,
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),
