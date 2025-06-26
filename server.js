@@ -21,7 +21,7 @@ class PostsServer {
   constructor() {
     this.serverId = process.env.SERVER_ID || `posts_${Date.now()}`
     this.port = process.env.PORT || 3000
-    
+
     // Минимальный статистический кеш (только счетчики)
     this.stats = {
       totalEvents: 0,
@@ -40,7 +40,7 @@ class PostsServer {
     this.app = express()
     this.server = http.createServer(this.app)
     this.wss = new WebSocket.Server({ server: this.server })
-    
+
     this.setupMiddleware()
 
     // База данных (основное хранилище)
@@ -104,14 +104,14 @@ class PostsServer {
     // Получить ленту событий (основной запрос фронтенда)
     this.app.get('/api/feed', async (req, res) => {
       try {
-        const { 
-          page = 1, 
-          limit = 50, 
-          search, 
-          city, 
-          category, 
+        const {
+          page = 1,
+          limit = 50,
+          search,
+          city,
+          category,
           authorId,
-          since 
+          since
         } = req.query
 
         console.log(`📡 Feed request: page=${page}, limit=${limit}, search="${search || ''}"`)
@@ -153,9 +153,6 @@ class PostsServer {
         }
 
         const event = await this.createEvent(eventData)
-        
-        // Уведомляем WebSocket клиентов
-        this.broadcastToClients('EVENT_CREATED', event)
 
         res.json(event)
         console.log(`✅ Event created: ${event.title} (${event.id})`)
@@ -166,6 +163,8 @@ class PostsServer {
       }
     })
 
+    this.broadcastToClients('EVENT_CREATED', event)
+
     // Обновить событие
     this.app.put('/api/events/:id', async (req, res) => {
       try {
@@ -173,7 +172,7 @@ class PostsServer {
         const updates = req.body
 
         const event = await this.updateEvent(id, updates)
-        
+
         if (!event) {
           return res.status(404).json({ error: 'Event not found' })
         }
@@ -240,10 +239,10 @@ class PostsServer {
 
         const results = await this.batchUpdateLikes(updates)
 
-        res.json({ 
-          success: true, 
+        res.json({
+          success: true,
           updated: results.length,
-          results 
+          results
         })
 
         console.log(`📊 Batch updated ${results.length} likes`)
@@ -296,34 +295,41 @@ class PostsServer {
       console.log(`📡 WebSocket client connected (${this.wsClients.size} total)`)
 
       // Отправляем статистику при подключении
-      ws.send(JSON.stringify({ 
-        type: 'STATS', 
+      ws.send(JSON.stringify({
+        type: 'STATS',
         data: {
           totalEvents: this.stats.totalEvents,
           connectedClients: this.wsClients.size
         }
       }))
 
-      ws.on('close', () => {
-        this.wsClients.delete(ws)
-        console.log(`📡 WebSocket client disconnected (${this.wsClients.size} remaining)`)
-      })
-
       ws.on('error', (error) => {
         console.error('WebSocket error:', error)
         this.wsClients.delete(ws)
       })
+
+      ws.on('message', (message) => {
+        try {
+          const data = JSON.parse(message)
+          console.log('📡 Received WebSocket message:', data.type)
+
+          // Ретранслируем сообщения всем остальным клиентам
+          this.broadcastToClients(data.type, data.data, ws)
+        } catch (error) {
+          console.error('WebSocket message parse error:', error)
+        }
+      })
     })
   }
 
-  broadcastToClients(type, data) {
+  broadcastToClients(type, data, excludeClient = null) {
     if (this.wsClients.size === 0) return
 
     const message = JSON.stringify({ type, data, timestamp: Date.now() })
     let sent = 0
 
     this.wsClients.forEach(client => {
-      if (client.readyState === WebSocket.OPEN) {
+      if (client !== excludeClient && client.readyState === WebSocket.OPEN) {
         try {
           client.send(message)
           sent++
@@ -331,7 +337,7 @@ class PostsServer {
           console.error('WebSocket send error:', error)
           this.wsClients.delete(client)
         }
-      } else {
+      } else if (client.readyState !== WebSocket.OPEN) {
         this.wsClients.delete(client)
       }
     })
@@ -481,7 +487,7 @@ class PostsServer {
 
       if (search) {
         const searchLower = search.toLowerCase()
-        events = events.filter(event => 
+        events = events.filter(event =>
           event.title.toLowerCase().includes(searchLower) ||
           event.description.toLowerCase().includes(searchLower)
         )
@@ -492,7 +498,7 @@ class PostsServer {
       if (authorId) events = events.filter(event => event.authorId === authorId)
 
       events.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-      
+
       const offset = (page - 1) * limit
       return events.slice(offset, offset + limit).map(event => this.formatEventForAPI(event))
     }
@@ -539,7 +545,7 @@ class PostsServer {
 
       const params = [eventId, ...Object.values(updateData)]
       const result = await this.db.query(query, params)
-      
+
       return result.rows[0] ? this.formatEventFromDB(result.rows[0]) : null
     } else {
       const event = this.memoryEvents.get(eventId)
@@ -577,7 +583,7 @@ class PostsServer {
     }
 
     const results = []
-    
+
     for (const update of updates) {
       try {
         const result = await this.db.query(`
@@ -709,7 +715,7 @@ class PostsServer {
     // Обновляем статистику каждые 5 минут
     setInterval(async () => {
       await this.updateStats()
-      
+
       // Принудительная сборка мусора при высоком потреблении
       const memUsage = process.memoryUsage().heapUsed
       if (memUsage > 300 * 1024 * 1024) { // 300MB
@@ -740,7 +746,7 @@ class PostsServer {
             AND created_at < NOW() - INTERVAL '30 days'
             AND likes < 1
           `)
-          
+
           if (result.rowCount > 0) {
             console.log(`🗂️ Archived ${result.rowCount} old events`)
             await this.updateStats()
