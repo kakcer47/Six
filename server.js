@@ -110,6 +110,10 @@ class PostsServer {
           search,
           city,
           category,
+          gender,
+          ageGroup,
+          dateFrom,
+          dateTo,
           authorId,
           since
         } = req.query
@@ -118,12 +122,8 @@ class PostsServer {
 
         const events = await this.getEvents({
           page: parseInt(page),
-          limit: Math.min(parseInt(limit), 100), // Максимум 100
-          search,
-          city,
-          category,
-          authorId,
-          since
+          limit: Math.min(parseInt(limit), 100),
+          search, city, category, gender, ageGroup, dateFrom, dateTo, authorId, since
         })
 
         res.json({
@@ -344,48 +344,60 @@ class PostsServer {
   }
 
   // === БАЗА ДАННЫХ ===
-
   async initializeDatabase() {
     try {
       await this.db.query(`
-        CREATE TABLE IF NOT EXISTS events (
-          id TEXT PRIMARY KEY,
-          title TEXT NOT NULL,
-          description TEXT NOT NULL,
-          author_id TEXT NOT NULL,
-          author_name TEXT NOT NULL,
-          city TEXT DEFAULT '',
-          category TEXT DEFAULT '',
-          likes INTEGER DEFAULT 0,
-          created_at TIMESTAMP DEFAULT NOW(),
-          updated_at TIMESTAMP DEFAULT NOW(),
-          status TEXT DEFAULT 'active'
-        )
-      `)
+      CREATE TABLE IF NOT EXISTS events (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        author_id TEXT NOT NULL,
+        author_name TEXT NOT NULL,
+        author_avatar TEXT DEFAULT '',
+        author_username TEXT DEFAULT '',
+        author_telegram_id BIGINT,
+        city TEXT DEFAULT '',
+        category TEXT DEFAULT '',
+        gender TEXT DEFAULT '',
+        age_group TEXT DEFAULT '',
+        date_from DATE,
+        date_to DATE,
+        likes INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        status TEXT DEFAULT 'active'
+      )
+    `)
 
-      // Индексы для производительности
+      // Добавляем новые колонки для существующих баз
       await this.db.query(`
-        CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
-        CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_events_author ON events(author_id);
-        CREATE INDEX IF NOT EXISTS idx_events_city ON events(city);
-        CREATE INDEX IF NOT EXISTS idx_events_category ON events(category);
-        CREATE INDEX IF NOT EXISTS idx_events_likes ON events(likes DESC);
-      `)
+      ALTER TABLE events 
+      ADD COLUMN IF NOT EXISTS gender TEXT DEFAULT '',
+      ADD COLUMN IF NOT EXISTS age_group TEXT DEFAULT '',
+      ADD COLUMN IF NOT EXISTS date_from DATE,
+      ADD COLUMN IF NOT EXISTS date_to DATE,
+      ADD COLUMN IF NOT EXISTS author_avatar TEXT DEFAULT '',
+      ADD COLUMN IF NOT EXISTS author_username TEXT DEFAULT '',
+      ADD COLUMN IF NOT EXISTS author_telegram_id BIGINT
+    `)
+
+      // Индексы
+      await this.db.query(`
+      CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
+      CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_events_author ON events(author_id);
+      CREATE INDEX IF NOT EXISTS idx_events_city ON events(city);
+      CREATE INDEX IF NOT EXISTS idx_events_category ON events(category);
+      CREATE INDEX IF NOT EXISTS idx_events_gender ON events(gender);
+      CREATE INDEX IF NOT EXISTS idx_events_age_group ON events(age_group);
+      CREATE INDEX IF NOT EXISTS idx_events_likes ON events(likes DESC);
+    `)
 
       console.log('✅ Posts database initialized')
     } catch (error) {
       console.error('❌ Database initialization failed:', error)
     }
   }
-
-  ALTER TABLE events ADD COLUMN IF NOT EXISTS gender TEXT DEFAULT '';
-  ALTER TABLE events ADD COLUMN IF NOT EXISTS age_group TEXT DEFAULT '';
-  ALTER TABLE events ADD COLUMN IF NOT EXISTS date_from DATE;
-  ALTER TABLE events ADD COLUMN IF NOT EXISTS date_to DATE;
-  ALTER TABLE events ADD COLUMN IF NOT EXISTS author_avatar TEXT DEFAULT '';
-  ALTER TABLE events ADD COLUMN IF NOT EXISTS author_username TEXT DEFAULT '';
-  ALTER TABLE events ADD COLUMN IF NOT EXISTS author_telegram_id BIGINT;
 
   async updateStats() {
     if (!this.db) {
