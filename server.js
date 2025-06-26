@@ -426,8 +426,15 @@ class PostsServer {
       description: eventData.description.trim(),
       authorId: eventData.authorId,
       authorName: eventData.author?.fullName || eventData.authorName || 'Anonymous',
+      authorAvatar: eventData.author?.avatar || '',
+      authorUsername: eventData.author?.username || '',
+      authorTelegramId: eventData.author?.telegramId || null,
       city: eventData.city?.trim() || '',
       category: eventData.category || '',
+      gender: eventData.gender || '',
+      ageGroup: eventData.ageGroup || '',
+      dateFrom: eventData.dateFrom || null,
+      dateTo: eventData.dateTo || null,
       likes: 0,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -482,6 +489,30 @@ class PostsServer {
     if (authorId) {
       query += ` AND author_id = $${paramIndex}`
       params.push(authorId)
+      paramIndex++
+    }
+
+    if (gender) {
+      query += ` AND gender = $${paramIndex}`
+      params.push(gender)
+      paramIndex++
+    }
+
+    if (ageGroup) {
+      query += ` AND age_group = $${paramIndex}`
+      params.push(ageGroup)
+      paramIndex++
+    }
+
+    if (dateFrom) {
+      query += ` AND (date_to IS NULL OR date_to >= $${paramIndex})`
+      params.push(dateFrom)
+      paramIndex++
+    }
+
+    if (dateTo) {
+      query += ` AND (date_from IS NULL OR date_from <= $${paramIndex})`
+      params.push(dateTo)
       paramIndex++
     }
 
@@ -720,10 +751,17 @@ class PostsServer {
       description: event.description,
       authorId: event.authorId,
       author: {
-        fullName: event.authorName
+        fullName: event.authorName,
+        avatar: event.authorAvatar,
+        username: event.authorUsername,
+        telegramId: event.authorTelegramId
       },
       city: event.city || '',
       category: event.category || '',
+      gender: event.gender || '',
+      ageGroup: event.ageGroup || '',
+      dateFrom: event.dateFrom,
+      dateTo: event.dateTo,
       likes: event.likes || 0,
       createdAt: event.createdAt,
       updatedAt: event.updatedAt,
