@@ -1,183 +1,141 @@
 #!/usr/bin/env node
 /**
- * Distributed Events Server - Peer-to-Peer Architecture
- * =====================================================
+ * Posts Server - Optimized for Render Production
+ * ==============================================
  * 
- * Каждый сервер равноправен и может:
- * - Обрабатывать запросы от фронтенда
- * - Синхронизироваться с другими серверами
- * - Заменить любой другой сервер при сбое
- * - Хранить полный кеш событий (500MB)
+ * Оптимизированный сервер для событий:
+ * - Минимальное использование RAM (< 100MB)
+ * - Stateless архитектура
+ * - Без кеша (только БД)
+ * - Быстрые простые запросы
+ * - Интеграция с Accounts сервером
  */
 
 const express = require('express')
-const http = require('http')
-const WebSocket = require('ws')
-const TelegramBot = require('node-telegram-bot-api')
 const cors = require('cors')
 const { Pool } = require('pg')
-const Redis = require('ioredis')
-const crypto = require('crypto')
+const WebSocket = require('ws')
+const http = require('http')
 
-class DistributedEventServer {
+class PostsServer {
   constructor() {
-    // Уникальная идентификация сервера
-    this.serverId = process.env.SERVER_ID || `server_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-    this.region = process.env.REGION || 'US'
+    this.serverId = process.env.SERVER_ID || `posts_${Date.now()}`
     this.port = process.env.PORT || 3000
+    
+    // Минимальный статистический кеш (только счетчики)
+    this.stats = {
+      totalEvents: 0,
+      totalRequests: 0,
+      startTime: Date.now()
+    }
 
-    // Peer-to-peer конфигурация
-    this.peers = this.parsePeers(process.env.PEER_SERVERS || '')
-    this.isLeader = false
-    this.lastLeaderPing = Date.now()
-    this.leaderTimeout = 30000 // 30 секунд
-
-    // Локальный кеш (500MB limit)
-    this.localCache = new Map() // eventId -> event
-    this.cacheMetadata = new Map() // eventId -> {timestamp, size, accessCount}
-    this.maxCacheSize = 500 * 1024 * 1024 // 500MB в байтах
-    this.currentCacheSize = 0
-
-    this.cacheFile = './events_cache.json'
-
-    // Синхронизация
-    this.lastSyncTime = 0
-    this.syncInterval = 30000 // 30 секунд
-    this.conflictResolution = 'last_write_wins' // или 'vector_clocks'
+    // WebSocket клиенты для real-time обновлений
+    this.wsClients = new Set()
 
     this.initializeServices()
   }
 
-  parsePeers(peerString) {
-    /**
-     * Парсит строку пиров вида: "server1.com:3000,server2.com:3000"
-     */
-    if (!peerString) return []
-
-    return peerString.split(',').map(peer => {
-      const [host, port] = peer.trim().split(':')
-      return { host, port: parseInt(port) || 3000, id: `${host}_${port}` }
-    }).filter(peer => peer.host && !this.isOwnServer(peer))
-  }
-
-  isOwnServer(peer) {
-    const ownHost = process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'
-    return peer.host === ownHost && peer.port === this.port
-  }
-
   async initializeServices() {
-    // 1. Express приложение
+    // Express + WebSocket
     this.app = express()
     this.server = http.createServer(this.app)
     this.wss = new WebSocket.Server({ server: this.server })
+    
+    this.setupMiddleware()
 
-    // 2. База данных (общая для всех серверов)
+    // База данных (основное хранилище)
     if (process.env.DATABASE_URL && process.env.DATABASE_URL !== 'disabled') {
       this.db = new Pool({
         connectionString: process.env.DATABASE_URL,
         ssl: process.env.NODE_ENV === 'production',
-        max: 3
+        max: 5, // Минимум подключений
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000
       })
+      await this.initializeDatabase()
+      await this.updateStats()
     } else {
+      console.log('📝 Database disabled - using memory store')
+      this.memoryEvents = new Map()
       this.db = null
-      console.log('📝 Database disabled - running in memory-only mode')
     }
 
-    // 3. Redis для pub/sub между серверами (опционально)
-    if (process.env.REDIS_URL) {
-      this.redis = new Redis(process.env.REDIS_URL)
-      this.redisSub = new Redis(process.env.REDIS_URL)
-    }
-
-    // 4. Telegram бот
-    if (process.env.BOT_TOKEN) {
-      this.telegramBot = new TelegramBot(process.env.BOT_TOKEN)
-      this.telegramGroupId = process.env.GROUP_ID
-    }
-
-    // 5. WebSocket клиенты
-    this.wsClients = new Set()
-
-    this.setupMiddleware()
     this.setupRoutes()
     this.setupWebSocket()
-    this.setupPeerToPeer()
-
-    if (this.db) {
-      await this.initializeDatabase()
-      await this.loadCacheFromDatabase()
-    } else {
-      console.log('📝 Database disabled - loading from file cache')
-      this.loadCacheFromFile()
-      console.log(`💾 Cache loaded, size: ${this.localCache.size}`)
-    }
-    await this.startLeaderElection()
-    this.startPeriodicTasks()
+    this.startCleanupTasks()
 
     this.server.listen(this.port, () => {
-      console.log(`🚀 Distributed Server [${this.serverId}] running on port ${this.port}`)
-      console.log(`📍 Region: ${this.region}`)
-      console.log(`👥 Peers: ${this.peers.map(p => p.id).join(', ') || 'None'}`)
-      console.log(`💾 Cache: 0MB / 500MB`)
+      console.log(`📰 Posts Server [${this.serverId}] running on port ${this.port}`)
+      console.log(`💾 Database: ${this.db ? 'PostgreSQL' : 'Memory'}`)
+      console.log(`📊 Total events: ${this.stats.totalEvents}`)
+      console.log(`🧠 Memory usage: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`)
     })
   }
 
   setupMiddleware() {
     this.app.use(cors())
-    this.app.use(express.json({ limit: '10mb' }))
+    this.app.use(express.json({ limit: '2mb' }))
+
+    // Request logging & stats
+    this.app.use((req, res, next) => {
+      this.stats.totalRequests++
+      console.log(`📝 ${req.method} ${req.path} - ${req.ip}`)
+      next()
+    })
 
     // Health check
     this.app.get('/health', (req, res) => {
       res.json({
         serverId: this.serverId,
-        region: this.region,
-        isLeader: this.isLeader,
-        cacheSize: this.formatBytes(this.currentCacheSize),
-        peersCount: this.peers.length,
-        eventsCount: this.localCache.size,
-        uptime: process.uptime(),
+        service: 'posts',
+        totalEvents: this.stats.totalEvents,
+        totalRequests: this.stats.totalRequests,
+        wsClients: this.wsClients.size,
+        memoryUsage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        uptime: Math.round((Date.now() - this.stats.startTime) / 1000),
         status: 'healthy'
       })
     })
   }
 
   setupRoutes() {
-    // === API для фронтенда ===
+    // === ОСНОВНЫЕ API ===
 
-    // Получить ленту событий
+    // Получить ленту событий (основной запрос фронтенда)
     this.app.get('/api/feed', async (req, res) => {
       try {
-        const { page = 1, limit = 20, search, city, category, authorId } = req.query
+        const { 
+          page = 1, 
+          limit = 50, 
+          search, 
+          city, 
+          category, 
+          authorId,
+          since 
+        } = req.query
 
-        console.log(`📡 === FEED REQUEST ===`)
-        console.log(`📡 Cache size: ${this.localCache.size}`)
-        console.log(`📡 Request params:`, { page, limit, search, city, category, authorId })
+        console.log(`📡 Feed request: page=${page}, limit=${limit}, search="${search || ''}"`)
 
-        // ← ДОБАВЬ ПРОВЕРКУ КЕША
-        if (this.localCache.size === 0) {
-          console.log(`⚠️ Cache is empty! Trying to reload from file...`)
-          this.loadCacheFromFile()
-          console.log(`📡 After reload, cache size: ${this.localCache.size}`)
-        }
-
-        const events = await this.getEventsFromCache({
+        const events = await this.getEvents({
           page: parseInt(page),
-          limit: parseInt(limit),
+          limit: Math.min(parseInt(limit), 100), // Максимум 100
           search,
           city,
           category,
-          authorId
+          authorId,
+          since
         })
-
-        console.log(`📡 Returning ${events.length} events`)
-        console.log(`📡 Event titles:`, events.map(e => e.title))
 
         res.json({
           posts: events,
           hasMore: events.length === parseInt(limit),
-          total: this.localCache.size,
-          serverId: this.serverId
+          total: this.stats.totalEvents,
+          serverId: this.serverId,
+          timestamp: Date.now()
         })
+
+        console.log(`📡 Returned ${events.length} events`)
+
       } catch (error) {
         console.error('Feed error:', error)
         res.status(500).json({ error: 'Failed to fetch events' })
@@ -188,8 +146,20 @@ class DistributedEventServer {
     this.app.post('/api/events', async (req, res) => {
       try {
         const eventData = req.body
+
+        // Валидация
+        if (!eventData.title || !eventData.description || !eventData.authorId) {
+          return res.status(400).json({ error: 'Missing required fields' })
+        }
+
         const event = await this.createEvent(eventData)
+        
+        // Уведомляем WebSocket клиентов
+        this.broadcastToClients('EVENT_CREATED', event)
+
         res.json(event)
+        console.log(`✅ Event created: ${event.title} (${event.id})`)
+
       } catch (error) {
         console.error('Create event error:', error)
         res.status(500).json({ error: 'Failed to create event' })
@@ -201,8 +171,19 @@ class DistributedEventServer {
       try {
         const { id } = req.params
         const updates = req.body
+
         const event = await this.updateEvent(id, updates)
+        
+        if (!event) {
+          return res.status(404).json({ error: 'Event not found' })
+        }
+
+        // Уведомляем клиентов
+        this.broadcastToClients('EVENT_UPDATED', event)
+
         res.json(event)
+        console.log(`📝 Event updated: ${id}`)
+
       } catch (error) {
         console.error('Update event error:', error)
         res.status(500).json({ error: 'Failed to update event' })
@@ -213,574 +194,152 @@ class DistributedEventServer {
     this.app.delete('/api/events/:id', async (req, res) => {
       try {
         const { id } = req.params
+
         await this.deleteEvent(id)
+
+        // Уведомляем клиентов
+        this.broadcastToClients('EVENT_DELETED', { id })
+
         res.json({ success: true })
+        console.log(`🗑️ Event deleted: ${id}`)
+
       } catch (error) {
         console.error('Delete event error:', error)
         res.status(500).json({ error: 'Failed to delete event' })
       }
     })
 
-    // === API для peer-to-peer синхронизации ===
-
-    // Получить события для синхронизации
-    this.app.get('/api/sync/events', this.authenticatePeer.bind(this), async (req, res) => {
+    // Получить конкретное событие
+    this.app.get('/api/events/:id', async (req, res) => {
       try {
-        const { since, limit = 100 } = req.query
-        const events = this.getEventsForSync(since, limit)
+        const { id } = req.params
+        const event = await this.getEventById(id)
 
-        res.json({
-          events,
-          serverId: this.serverId,
-          timestamp: Date.now()
-        })
-      } catch (error) {
-        console.error('Sync events error:', error)
-        res.status(500).json({ error: 'Sync failed' })
-      }
-    })
-
-    // Получить синхронизацию от пира
-    this.app.post('/api/sync/receive', this.authenticatePeer.bind(this), async (req, res) => {
-      try {
-        const { events, fromServerId, timestamp } = req.body
-        await this.receiveSyncEvents(events, fromServerId, timestamp)
-
-        res.json({
-          success: true,
-          receivedCount: events.length,
-          serverId: this.serverId
-        })
-      } catch (error) {
-        console.error('Receive sync error:', error)
-        res.status(500).json({ error: 'Failed to receive sync' })
-      }
-    })
-
-    // Пинг от другого сервера
-    this.app.post('/api/peer/ping', this.authenticatePeer.bind(this), (req, res) => {
-      const { fromServerId, isLeader } = req.body
-
-      if (isLeader) {
-        this.lastLeaderPing = Date.now()
-        if (this.isLeader && fromServerId !== this.serverId) {
-          console.log(`⚠️ Conflicting leader detected: ${fromServerId}`)
-          this.resolveLeaderConflict(fromServerId)
+        if (!event) {
+          return res.status(404).json({ error: 'Event not found' })
         }
+
+        res.json(event)
+
+      } catch (error) {
+        console.error('Get event error:', error)
+        res.status(500).json({ error: 'Failed to get event' })
       }
-
-      res.json({
-        serverId: this.serverId,
-        isLeader: this.isLeader,
-        timestamp: Date.now()
-      })
     })
-  }
 
-  authenticatePeer(req, res, next) {
-    // Простая аутентификация пиров (в продакшене - JWT или подписи)
-    const peerToken = req.headers['x-peer-token']
-    const expectedToken = process.env.PEER_TOKEN || 'default_peer_token'
+    // === BATCH ОПЕРАЦИИ ===
 
-    if (peerToken !== expectedToken) {
-      return res.status(401).json({ error: 'Unauthorized peer' })
-    }
+    // Batch обновление лайков (от Accounts сервера)
+    this.app.post('/api/events/batch/likes', async (req, res) => {
+      try {
+        const { updates } = req.body // [{ eventId, increment }]
 
-    next()
+        if (!Array.isArray(updates)) {
+          return res.status(400).json({ error: 'Updates must be an array' })
+        }
+
+        const results = await this.batchUpdateLikes(updates)
+
+        res.json({ 
+          success: true, 
+          updated: results.length,
+          results 
+        })
+
+        console.log(`📊 Batch updated ${results.length} likes`)
+
+      } catch (error) {
+        console.error('Batch likes error:', error)
+        res.status(500).json({ error: 'Failed to batch update likes' })
+      }
+    })
+
+    // === СТАТИСТИКА ===
+
+    // Статистика событий
+    this.app.get('/api/stats', async (req, res) => {
+      try {
+        const stats = await this.getDetailedStats()
+        res.json(stats)
+      } catch (error) {
+        console.error('Stats error:', error)
+        res.status(500).json({ error: 'Failed to get stats' })
+      }
+    })
+
+    // Топ города
+    this.app.get('/api/stats/cities', async (req, res) => {
+      try {
+        const cities = await this.getTopCities()
+        res.json(cities)
+      } catch (error) {
+        console.error('Cities stats error:', error)
+        res.status(500).json({ error: 'Failed to get cities stats' })
+      }
+    })
+
+    // Топ категории
+    this.app.get('/api/stats/categories', async (req, res) => {
+      try {
+        const categories = await this.getTopCategories()
+        res.json(categories)
+      } catch (error) {
+        console.error('Categories stats error:', error)
+        res.status(500).json({ error: 'Failed to get categories stats' })
+      }
+    })
   }
 
   setupWebSocket() {
     this.wss.on('connection', (ws) => {
       this.wsClients.add(ws)
-      console.log(`📡 Client connected (${this.wsClients.size} total)`)
+      console.log(`📡 WebSocket client connected (${this.wsClients.size} total)`)
+
+      // Отправляем статистику при подключении
+      ws.send(JSON.stringify({ 
+        type: 'STATS', 
+        data: {
+          totalEvents: this.stats.totalEvents,
+          connectedClients: this.wsClients.size
+        }
+      }))
 
       ws.on('close', () => {
         this.wsClients.delete(ws)
-        console.log(`📡 Client disconnected (${this.wsClients.size} remaining)`)
+        console.log(`📡 WebSocket client disconnected (${this.wsClients.size} remaining)`)
       })
 
-      ws.on('message', async (data) => {
-        try {
-          const message = JSON.parse(data.toString())
-          await this.handleWebSocketMessage(message, ws)
-        } catch (error) {
-          console.error('WebSocket message error:', error)
-        }
+      ws.on('error', (error) => {
+        console.error('WebSocket error:', error)
+        this.wsClients.delete(ws)
       })
     })
-  }
-
-  async handleWebSocketMessage(message, ws) {
-    const { type, data } = message
-
-    switch (type) {
-      case 'CREATE_EVENT':
-        try {
-          const event = await this.createEvent(data)
-          ws.send(JSON.stringify({ type: 'CREATE_EVENT_SUCCESS', data: event }))
-        } catch (error) {
-          ws.send(JSON.stringify({ type: 'CREATE_EVENT_ERROR', error: error.message }))
-        }
-        break
-
-      // ← ДОБАВЬ ЭТИ ОБРАБОТЧИКИ:
-      case 'UPDATE_EVENT':
-        try {
-          const { id, ...updates } = data
-          const event = await this.updateEvent(id, updates)
-          ws.send(JSON.stringify({ type: 'UPDATE_EVENT_SUCCESS', data: event }))
-        } catch (error) {
-          ws.send(JSON.stringify({ type: 'UPDATE_EVENT_ERROR', error: error.message }))
-        }
-        break
-
-      case 'DELETE_EVENT':
-        try {
-          const { id } = data
-          await this.deleteEvent(id)
-          ws.send(JSON.stringify({ type: 'DELETE_EVENT_SUCCESS', data: { id } }))
-        } catch (error) {
-          ws.send(JSON.stringify({ type: 'DELETE_EVENT_ERROR', error: error.message }))
-        }
-        break
-
-      case 'LIKE_EVENT':
-        try {
-          const { id, isLiked } = data
-          const event = await this.likeEvent(id, isLiked)
-          this.broadcastToClients('EVENT_LIKED', { id, isLiked, likes: event.likes })
-          ws.send(JSON.stringify({ type: 'LIKE_EVENT_SUCCESS', data: event }))
-        } catch (error) {
-          ws.send(JSON.stringify({ type: 'LIKE_EVENT_ERROR', error: error.message }))
-        }
-        break
-
-      default:
-        ws.send(JSON.stringify({ type: 'ERROR', error: 'Unknown message type' }))
-    }
   }
 
   broadcastToClients(type, data) {
-    const message = JSON.stringify({ type, data })
+    if (this.wsClients.size === 0) return
+
+    const message = JSON.stringify({ type, data, timestamp: Date.now() })
+    let sent = 0
+
     this.wsClients.forEach(client => {
       if (client.readyState === WebSocket.OPEN) {
-        client.send(message)
-      }
-    })
-  }
-
-  // === PEER-TO-PEER СИСТЕМА ===
-
-  setupPeerToPeer() {
-    // Настройка Redis pub/sub для мгновенного уведомления пиров
-    if (this.redis) {
-      this.redisSub.subscribe('events_channel')
-      this.redisSub.on('message', (channel, message) => {
-        if (channel === 'events_channel') {
-          this.handlePeerNotification(JSON.parse(message))
+        try {
+          client.send(message)
+          sent++
+        } catch (error) {
+          console.error('WebSocket send error:', error)
+          this.wsClients.delete(client)
         }
-      })
-    }
-  }
-
-  async startLeaderElection() {
-    // Простой алгоритм выбора лидера - сервер с наименьшим ID
-    const allServerIds = [this.serverId, ...this.peers.map(p => p.id)].sort()
-    const shouldBeLeader = allServerIds[0] === this.serverId
-
-    if (shouldBeLeader && !this.isLeader) {
-      console.log(`👑 ${this.serverId} elected as leader`)
-      this.isLeader = true
-      await this.announceLeadership()
-    }
-
-    // Проверяем лидера каждые 10 секунд
-    setInterval(() => {
-      this.checkLeaderHealth()
-    }, 10000)
-  }
-
-  async announceLeadership() {
-    // Уведомляем всех пиров о лидерстве
-    for (const peer of this.peers) {
-      try {
-        await this.pingPeer(peer, true)
-      } catch (error) {
-        console.log(`Failed to announce leadership to ${peer.id}:`, error.message)
-      }
-    }
-  }
-
-  checkLeaderHealth() {
-    if (!this.isLeader && Date.now() - this.lastLeaderPing > this.leaderTimeout) {
-      console.log(`💀 Leader timeout detected, starting new election`)
-      this.startLeaderElection()
-    }
-  }
-
-  async resolveLeaderConflict(conflictingLeaderId) {
-    // Разрешение конфликта лидерства - выбираем сервер с меньшим ID
-    if (conflictingLeaderId < this.serverId) {
-      console.log(`🤝 Stepping down from leadership in favor of ${conflictingLeaderId}`)
-      this.isLeader = false
-    }
-  }
-
-  startPeriodicTasks() {
-    // Синхронизация с пирами
-    setInterval(() => {
-      this.syncWithPeers()
-    }, this.syncInterval)
-
-    // Очистка кеша
-    setInterval(() => {
-      this.cleanupCache()
-    }, 300000) // 5 минут
-
-    // Anti-sleep пинги
-    setInterval(() => {
-      this.performAntiSleepPings()
-    }, 600000) // 10 минут
-
-    // Пинг пиров
-    setInterval(() => {
-      this.pingAllPeers()
-    }, 15000) // 15 секунд
-  }
-
-  saveCacheToFile() {
-    try {
-      const cacheData = {
-        events: Array.from(this.localCache.values()),
-        timestamp: Date.now()
-      }
-      require('fs').writeFileSync(this.cacheFile, JSON.stringify(cacheData, null, 2))
-      console.log('💾 Cache saved to file')
-    } catch (error) {
-      console.error('Failed to save cache to file:', error)
-    }
-  }
-
-  loadCacheFromFile() {
-    try {
-      if (require('fs').existsSync(this.cacheFile)) {
-        const cacheData = JSON.parse(require('fs').readFileSync(this.cacheFile, 'utf8'))
-        const events = cacheData.events || []
-
-        // Очищаем кеш перед загрузкой
-        this.localCache.clear()
-        this.cacheMetadata.clear()
-        this.currentCacheSize = 0
-
-        for (const event of events) {
-          this.addToCache(event.id, event)
-        }
-
-        console.log(`💾 Loaded ${events.length} events from file cache`)
       } else {
-        console.log('💾 No cache file found, starting with empty cache')
+        this.wsClients.delete(client)
       }
-    } catch (error) {
-      console.error('Failed to load cache from file:', error)
-    }
-  }
-
-  // === УПРАВЛЕНИЕ КЕШЕМ ===
-
-  async loadCacheFromDatabase() {
-    try {
-      if (!this.db) {
-        console.log('💾 Database disabled - cache will start empty')
-        this.loadCacheFromFile()
-        return
-      }
-
-      const result = await this.db.query(`
-        SELECT * FROM events 
-        WHERE status = 'active' 
-        ORDER BY created_at DESC 
-        LIMIT 1000
-      `)
-
-      for (const row of result.rows) {
-        const event = this.formatEventFromDB(row)
-        this.addToCache(event.id, event)
-        this.saveCacheToFile()
-      }
-
-      console.log(`💾 Loaded ${result.rows.length} events from database`)
-    } catch (error) {
-      console.error('Failed to load cache from database:', error)
-    }
-  }
-
-  addToCache(eventId, event) {
-    const eventSize = this.calculateEventSize(event)
-
-    // Проверяем лимит кеша
-    if (this.currentCacheSize + eventSize > this.maxCacheSize) {
-      this.evictLRUEvents(eventSize)
-    }
-
-    this.localCache.set(eventId, event)
-    this.cacheMetadata.set(eventId, {
-      timestamp: Date.now(),
-      size: eventSize,
-      accessCount: 1
-    })
-    this.currentCacheSize += eventSize
-
-    console.log(`📥 Added to cache: ${eventId} (${this.formatBytes(eventSize)})`)
-  }
-
-  evictLRUEvents(neededSpace) {
-    // Удаляем наименее используемые события
-    const sorted = Array.from(this.cacheMetadata.entries())
-      .sort((a, b) => a[1].accessCount - b[1].accessCount || a[1].timestamp - b[1].timestamp)
-
-    let freedSpace = 0
-    for (const [eventId, metadata] of sorted) {
-      if (freedSpace >= neededSpace) break
-
-      this.localCache.delete(eventId)
-      this.cacheMetadata.delete(eventId)
-      this.currentCacheSize -= metadata.size
-      freedSpace += metadata.size
-
-      console.log(`🗑️ Evicted from cache: ${eventId}`)
-    }
-  }
-
-  calculateEventSize(event) {
-    // Примерный расчет размера события в байтах
-    return JSON.stringify(event).length * 2 // UTF-16 encoding
-  }
-
-  formatBytes(bytes) {
-    return (bytes / (1024 * 1024)).toFixed(1) + 'MB'
-  }
-
-  // === CRUD ОПЕРАЦИИ ===
-
-  async createEvent(eventData) {
-    const event = {
-      id: `${this.serverId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      title: eventData.title,
-      description: eventData.description,
-      authorId: eventData.authorId,
-      author: eventData.author,
-      city: eventData.city || '',
-      category: eventData.category || '',
-      likes: 0,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      status: 'active',
-      serverId: this.serverId,
-      version: 1
-    }
-
-    // Сохраняем в базу данных
-    //await this.saveEventToDB(event)
-
-    // Добавляем в локальный кеш
-    this.addToCache(event.id, event)
-
-    setTimeout(() => {
-      this.saveCacheToFile()
-      console.log(`💾 Cache saved after creating: ${event.title}`)
-    }, 100)
-
-    // Уведомляем пиров
-    await this.notifyPeers('EVENT_CREATED', event)
-
-    // Отправляем в Telegram (только лидер)
-    if (this.isLeader && this.telegramBot) {
-      await this.sendToTelegram(event)
-    }
-
-    // Уведомляем WebSocket клиентов
-    this.broadcastToClients('EVENT_CREATED', event)
-
-    console.log(`✅ Event created: ${event.title} (${event.id})`)
-    return event
-  }
-
-  async updateEvent(eventId, updates) {
-    let event = this.localCache.get(eventId)
-
-    if (!event) {
-      if (this.db) {
-        event = await this.loadEventFromDB(eventId)
-      }
-      if (!event) {
-        throw new Error('Event not found')
-      }
-    }
-
-    // Обновляем событие
-    const updatedEvent = {
-      ...event,
-      ...updates,
-      updatedAt: new Date().toISOString(),
-      version: event.version + 1
-    }
-
-    // Сохраняем в базу если есть
-    if (this.db) {
-      await this.saveEventToDB(updatedEvent)
-    }
-
-    // Обновляем кеш
-    this.addToCache(eventId, updatedEvent)
-
-    // Уведомляем пиров
-    await this.notifyPeers('EVENT_UPDATED', updatedEvent)
-
-    // Уведомляем клиентов
-    this.broadcastToClients('EVENT_UPDATED', updatedEvent)
-
-    return updatedEvent
-  }
-
-  async deleteEvent(eventId) {
-    if (this.db) {
-      await this.db.query('UPDATE events SET status = $1 WHERE id = $2', ['deleted', eventId])
-    }
-
-    // Удаляем из кеша
-    if (this.localCache.has(eventId)) {
-      const metadata = this.cacheMetadata.get(eventId)
-      this.currentCacheSize -= metadata?.size || 0
-      this.localCache.delete(eventId)
-      this.cacheMetadata.delete(eventId)
-    }
-
-    // Уведомляем пиров
-    await this.notifyPeers('EVENT_DELETED', { id: eventId })
-
-    // Уведомляем клиентов
-    this.broadcastToClients('EVENT_DELETED', { id: eventId })
-  }
-
-  async likeEvent(eventId, isLiked) {
-    let event = this.localCache.get(eventId)
-
-    if (!event) {
-      if (this.db) {
-        event = await this.loadEventFromDB(eventId)
-      }
-      if (!event) {
-        throw new Error('Event not found')
-      }
-    }
-
-    const newLikes = isLiked ? event.likes + 1 : Math.max(0, event.likes - 1)
-
-    return await this.updateEvent(eventId, { likes: newLikes })
-  }
-
-  // === СИНХРОНИЗАЦИЯ ===
-
-  async syncWithPeers() {
-    if (this.peers.length === 0) return
-
-    console.log(`🔄 Starting sync with ${this.peers.length} peers`)
-
-    for (const peer of this.peers) {
-      try {
-        await this.syncWithPeer(peer)
-      } catch (error) {
-        console.log(`❌ Sync failed with ${peer.id}:`, error.message)
-      }
-    }
-  }
-
-  async syncWithPeer(peer) {
-    // Получаем события от пира
-    const response = await fetch(`http://${peer.host}:${peer.port}/api/sync/events?since=${this.lastSyncTime}`, {
-      headers: { 'x-peer-token': process.env.PEER_TOKEN || 'default_peer_token' },
-      timeout: 5000
     })
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-
-    const { events, serverId, timestamp } = await response.json()
-
-    if (events.length > 0) {
-      await this.receiveSyncEvents(events, serverId, timestamp)
-      console.log(`📥 Synced ${events.length} events from ${serverId}`)
-    }
+    console.log(`📡 Broadcasted ${type} to ${sent} clients`)
   }
 
-  async receiveSyncEvents(events, fromServerId, timestamp) {
-    for (const event of events) {
-      const existing = this.localCache.get(event.id)
-
-      if (!existing || existing.version < event.version) {
-        // Новое событие или более новая версия
-        if (this.db) {
-          await this.saveEventToDB(event)  // ← ИСПРАВЬ: было updatedEvent
-        }
-        this.addToCache(event.id, event)
-        this.saveCacheToFile()
-
-        // Уведомляем клиентов
-        this.broadcastToClients(existing ? 'EVENT_UPDATED' : 'EVENT_CREATED', event)
-      }
-    }
-
-    this.lastSyncTime = Math.max(this.lastSyncTime, timestamp)
-  }
-
-  getEventsForSync(since, limit) {
-    const sinceTime = parseInt(since) || 0
-    const events = Array.from(this.localCache.values())
-      .filter(event => new Date(event.updatedAt).getTime() > sinceTime)
-      .slice(0, limit)
-
-    return events
-  }
-
-  async notifyPeers(eventType, eventData) {
-    // Мгновенное уведомление через Redis
-    if (this.redis) {
-      await this.redis.publish('events_channel', JSON.stringify({
-        type: eventType,
-        data: eventData,
-        fromServerId: this.serverId,
-        timestamp: Date.now()
-      }))
-    }
-  }
-
-  handlePeerNotification(notification) {
-    const { type, data, fromServerId } = notification
-
-    if (fromServerId === this.serverId) return // Игнорируем свои уведомления
-
-    // Обрабатываем уведомление от пира
-    switch (type) {
-      case 'EVENT_CREATED':
-      case 'EVENT_UPDATED':
-        this.addToCache(data.id, data)
-        this.broadcastToClients(type, data)
-        break
-
-      case 'EVENT_DELETED':
-        if (this.localCache.has(data.id)) {
-          const metadata = this.cacheMetadata.get(data.id)
-          this.currentCacheSize -= metadata?.size || 0
-          this.localCache.delete(data.id)
-          this.cacheMetadata.delete(data.id)
-        }
-        this.broadcastToClients(type, data)
-        break
-    }
-  }
-
-  // === БАЗЫ ДАННЫХ ===
+  // === БАЗА ДАННЫХ ===
 
   async initializeDatabase() {
     try {
@@ -791,41 +350,318 @@ class DistributedEventServer {
           description TEXT NOT NULL,
           author_id TEXT NOT NULL,
           author_name TEXT NOT NULL,
-          city TEXT,
-          category TEXT,
+          city TEXT DEFAULT '',
+          category TEXT DEFAULT '',
           likes INTEGER DEFAULT 0,
           created_at TIMESTAMP DEFAULT NOW(),
           updated_at TIMESTAMP DEFAULT NOW(),
-          status TEXT DEFAULT 'active',
-          server_id TEXT,
-          version INTEGER DEFAULT 1
+          status TEXT DEFAULT 'active'
         )
       `)
-      console.log('✅ Database initialized')
+
+      // Индексы для производительности
+      await this.db.query(`
+        CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
+        CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_events_author ON events(author_id);
+        CREATE INDEX IF NOT EXISTS idx_events_city ON events(city);
+        CREATE INDEX IF NOT EXISTS idx_events_category ON events(category);
+        CREATE INDEX IF NOT EXISTS idx_events_likes ON events(likes DESC);
+      `)
+
+      console.log('✅ Posts database initialized')
     } catch (error) {
       console.error('❌ Database initialization failed:', error)
     }
   }
 
-  async saveEventToDB(event) {
-    await this.db.query(`
-      INSERT INTO events (id, title, description, author_id, author_name, city, category, likes, created_at, updated_at, status, server_id, version)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-      ON CONFLICT (id) DO UPDATE SET
-        title = $2, description = $3, author_id = $4, author_name = $5,
-        city = $6, category = $7, likes = $8, updated_at = $10, 
-        status = $11, server_id = $12, version = $13
-    `, [
-      event.id, event.title, event.description, event.authorId,
-      event.author.fullName, event.city, event.category, event.likes,
-      event.createdAt, event.updatedAt, event.status, event.serverId, event.version
-    ])
+  async updateStats() {
+    if (!this.db) {
+      this.stats.totalEvents = this.memoryEvents?.size || 0
+      return
+    }
+
+    try {
+      const result = await this.db.query(`
+        SELECT COUNT(*) as total 
+        FROM events 
+        WHERE status = 'active'
+      `)
+      this.stats.totalEvents = parseInt(result.rows[0]?.total || 0)
+    } catch (error) {
+      console.error('Stats update error:', error)
+    }
   }
 
-  async loadEventFromDB(eventId) {
-    const result = await this.db.query('SELECT * FROM events WHERE id = $1', [eventId])
-    return result.rows[0] ? this.formatEventFromDB(result.rows[0]) : null
+  // === CRUD ОПЕРАЦИИ ===
+
+  async createEvent(eventData) {
+    const event = {
+      id: `${this.serverId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      title: eventData.title.trim(),
+      description: eventData.description.trim(),
+      authorId: eventData.authorId,
+      authorName: eventData.author?.fullName || eventData.authorName || 'Anonymous',
+      city: eventData.city?.trim() || '',
+      category: eventData.category || '',
+      likes: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      status: 'active'
+    }
+
+    if (this.db) {
+      await this.db.query(`
+        INSERT INTO events (id, title, description, author_id, author_name, city, category, likes, created_at, updated_at, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `, [
+        event.id, event.title, event.description, event.authorId,
+        event.authorName, event.city, event.category, event.likes,
+        event.createdAt, event.updatedAt, event.status
+      ])
+    } else {
+      this.memoryEvents.set(event.id, event)
+    }
+
+    this.stats.totalEvents++
+    return this.formatEventForAPI(event)
   }
+
+  async getEvents({ page, limit, search, city, category, authorId, since }) {
+    let query = `
+      SELECT * FROM events 
+      WHERE status = 'active'
+    `
+    const params = []
+    let paramIndex = 1
+
+    // Фильтры
+    if (search) {
+      query += ` AND (title ILIKE $${paramIndex} OR description ILIKE $${paramIndex})`
+      params.push(`%${search}%`)
+      paramIndex++
+    }
+
+    if (city) {
+      query += ` AND city = $${paramIndex}`
+      params.push(city)
+      paramIndex++
+    }
+
+    if (category) {
+      query += ` AND category = $${paramIndex}`
+      params.push(category)
+      paramIndex++
+    }
+
+    if (authorId) {
+      query += ` AND author_id = $${paramIndex}`
+      params.push(authorId)
+      paramIndex++
+    }
+
+    if (since) {
+      query += ` AND updated_at > $${paramIndex}`
+      params.push(new Date(parseInt(since)))
+      paramIndex++
+    }
+
+    // Сортировка и пагинация
+    query += ` ORDER BY created_at DESC`
+    query += ` LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`
+    params.push(limit, (page - 1) * limit)
+
+    if (this.db) {
+      const result = await this.db.query(query, params)
+      return result.rows.map(row => this.formatEventFromDB(row))
+    } else {
+      // Memory fallback
+      let events = Array.from(this.memoryEvents.values())
+        .filter(event => event.status === 'active')
+
+      if (search) {
+        const searchLower = search.toLowerCase()
+        events = events.filter(event => 
+          event.title.toLowerCase().includes(searchLower) ||
+          event.description.toLowerCase().includes(searchLower)
+        )
+      }
+
+      if (city) events = events.filter(event => event.city === city)
+      if (category) events = events.filter(event => event.category === category)
+      if (authorId) events = events.filter(event => event.authorId === authorId)
+
+      events.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      
+      const offset = (page - 1) * limit
+      return events.slice(offset, offset + limit).map(event => this.formatEventForAPI(event))
+    }
+  }
+
+  async getEventById(eventId) {
+    if (this.db) {
+      const result = await this.db.query('SELECT * FROM events WHERE id = $1', [eventId])
+      return result.rows[0] ? this.formatEventFromDB(result.rows[0]) : null
+    } else {
+      const event = this.memoryEvents.get(eventId)
+      return event ? this.formatEventForAPI(event) : null
+    }
+  }
+
+  async updateEvent(eventId, updates) {
+    const allowedUpdates = ['title', 'description', 'city', 'category', 'likes']
+    const updateData = {}
+
+    // Фильтруем разрешенные поля
+    for (const [key, value] of Object.entries(updates)) {
+      if (allowedUpdates.includes(key)) {
+        updateData[key] = value
+      }
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      throw new Error('No valid fields to update')
+    }
+
+    updateData.updatedAt = new Date().toISOString()
+
+    if (this.db) {
+      const setClause = Object.keys(updateData)
+        .map((key, index) => `${this.camelToSnake(key)} = $${index + 2}`)
+        .join(', ')
+
+      const query = `
+        UPDATE events 
+        SET ${setClause}
+        WHERE id = $1 AND status = 'active'
+        RETURNING *
+      `
+
+      const params = [eventId, ...Object.values(updateData)]
+      const result = await this.db.query(query, params)
+      
+      return result.rows[0] ? this.formatEventFromDB(result.rows[0]) : null
+    } else {
+      const event = this.memoryEvents.get(eventId)
+      if (!event || event.status !== 'active') return null
+
+      Object.assign(event, updateData)
+      return this.formatEventForAPI(event)
+    }
+  }
+
+  async deleteEvent(eventId) {
+    if (this.db) {
+      await this.db.query('UPDATE events SET status = $1 WHERE id = $2', ['deleted', eventId])
+    } else {
+      const event = this.memoryEvents.get(eventId)
+      if (event) {
+        event.status = 'deleted'
+      }
+    }
+
+    this.stats.totalEvents = Math.max(0, this.stats.totalEvents - 1)
+  }
+
+  async batchUpdateLikes(updates) {
+    if (!this.db) {
+      // Memory fallback
+      return updates.map(update => {
+        const event = this.memoryEvents.get(update.eventId)
+        if (event) {
+          event.likes = Math.max(0, (event.likes || 0) + update.increment)
+          return { eventId: update.eventId, newLikes: event.likes }
+        }
+        return null
+      }).filter(Boolean)
+    }
+
+    const results = []
+    
+    for (const update of updates) {
+      try {
+        const result = await this.db.query(`
+          UPDATE events 
+          SET likes = GREATEST(0, likes + $1), updated_at = NOW()
+          WHERE id = $2 AND status = 'active'
+          RETURNING id, likes
+        `, [update.increment, update.eventId])
+
+        if (result.rows[0]) {
+          results.push({
+            eventId: result.rows[0].id,
+            newLikes: result.rows[0].likes
+          })
+        }
+      } catch (error) {
+        console.error(`Batch like update failed for ${update.eventId}:`, error)
+      }
+    }
+
+    return results
+  }
+
+  // === СТАТИСТИКА ===
+
+  async getDetailedStats() {
+    if (!this.db) {
+      return {
+        totalEvents: this.memoryEvents?.size || 0,
+        totalRequests: this.stats.totalRequests,
+        wsClients: this.wsClients.size,
+        uptime: Math.round((Date.now() - this.stats.startTime) / 1000),
+        memoryUsage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
+      }
+    }
+
+    const [total, recent, popular] = await Promise.all([
+      this.db.query('SELECT COUNT(*) as count FROM events WHERE status = $1', ['active']),
+      this.db.query('SELECT COUNT(*) as count FROM events WHERE status = $1 AND created_at > NOW() - INTERVAL \'24 hours\'', ['active']),
+      this.db.query('SELECT COUNT(*) as count FROM events WHERE status = $1 AND likes > 0', ['active'])
+    ])
+
+    return {
+      totalEvents: parseInt(total.rows[0]?.count || 0),
+      recentEvents: parseInt(recent.rows[0]?.count || 0),
+      popularEvents: parseInt(popular.rows[0]?.count || 0),
+      totalRequests: this.stats.totalRequests,
+      wsClients: this.wsClients.size,
+      uptime: Math.round((Date.now() - this.stats.startTime) / 1000),
+      memoryUsage: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
+    }
+  }
+
+  async getTopCities() {
+    if (!this.db) return []
+
+    const result = await this.db.query(`
+      SELECT city, COUNT(*) as count 
+      FROM events 
+      WHERE status = 'active' AND city != '' 
+      GROUP BY city 
+      ORDER BY count DESC 
+      LIMIT 10
+    `)
+
+    return result.rows
+  }
+
+  async getTopCategories() {
+    if (!this.db) return []
+
+    const result = await this.db.query(`
+      SELECT category, COUNT(*) as count 
+      FROM events 
+      WHERE status = 'active' AND category != '' 
+      GROUP BY category 
+      ORDER BY count DESC 
+      LIMIT 10
+    `)
+
+    return result.rows
+  }
+
+  // === УТИЛИТЫ ===
 
   formatEventFromDB(row) {
     return {
@@ -833,150 +669,116 @@ class DistributedEventServer {
       title: row.title,
       description: row.description,
       authorId: row.author_id,
-      author: { fullName: row.author_name },
+      author: {
+        fullName: row.author_name
+      },
       city: row.city || '',
       category: row.category || '',
       likes: row.likes || 0,
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),
-      status: row.status,
-      serverId: row.server_id,
-      version: row.version || 1
+      status: row.status
     }
   }
 
-  // === ПОИСК И ФИЛЬТРАЦИЯ ===
-
-  async getEventsFromCache({ page, limit, search, city, category, authorId }) {
-    console.log(`🔍 getEventsFromCache called: cache size=${this.localCache.size}`)
-
-    let events = Array.from(this.localCache.values())
-      .filter(event => event.status === 'active')
-
-    console.log(`🔍 Active events: ${events.length}`)
-
-    // Фильтрация по автору
-    if (authorId) {
-      events = events.filter(event => event.authorId === authorId)
-      console.log(`🔍 After authorId filter: ${events.length}`)
-    }
-
-    // Фильтрация по поиску
-    if (search) {
-      const searchLower = search.toLowerCase()
-      events = events.filter(event =>
-        event.title.toLowerCase().includes(searchLower) ||
-        event.description.toLowerCase().includes(searchLower)
-      )
-      console.log(`🔍 After search filter: ${events.length}`)
-    }
-
-    // Фильтрация по городу
-    if (city) {
-      events = events.filter(event => event.city === city)
-      console.log(`🔍 After city filter: ${events.length}`)
-    }
-
-    // Фильтрация по категории
-    if (category) {
-      events = events.filter(event => event.category === category)
-      console.log(`🔍 After category filter: ${events.length}`)
-    }
-
-    // Сортировка по дате создания (новые первые)
-    events.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-
-    // Пагинация
-    const offset = (page - 1) * limit
-    const result = events.slice(offset, offset + limit)
-
-    console.log(`🔍 Final result: ${result.length} events (offset=${offset}, limit=${limit})`)
-
-    return result
-  }
-
-  // === ANTI-SLEEP И МОНИТОРИНГ ===
-
-  async performAntiSleepPings() {
-    // Пингуем себя
-    try {
-      await fetch(`http://localhost:${this.port}/health`)
-      console.log(`🏓 Self-ping successful`)
-    } catch (error) {
-      console.log(`❌ Self-ping failed:`, error.message)
-    }
-
-    // Пингуем пиров
-    await this.pingAllPeers()
-  }
-
-  async pingAllPeers() {
-    for (const peer of this.peers) {
-      try {
-        await this.pingPeer(peer, this.isLeader)
-      } catch (error) {
-        console.log(`💔 Peer ${peer.id} unreachable`)
-      }
-    }
-  }
-
-  async pingPeer(peer, isLeader = false) {
-    const response = await fetch(`http://${peer.host}:${peer.port}/api/peer/ping`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-peer-token': process.env.PEER_TOKEN || 'default_peer_token'
+  formatEventForAPI(event) {
+    return {
+      id: event.id,
+      title: event.title,
+      description: event.description,
+      authorId: event.authorId,
+      author: {
+        fullName: event.authorName
       },
-      body: JSON.stringify({
-        fromServerId: this.serverId,
-        isLeader,
-        timestamp: Date.now()
-      }),
-      timeout: 3000
-    })
-
-    return await response.json()
-  }
-
-  async sendToTelegram(event) {
-    if (!this.telegramBot || !this.telegramGroupId) return
-
-    const message = `🎯 ${event.title}\n\n${event.description}\n\n📍 ${event.city}\n👤 ${event.author.fullName}`
-
-    try {
-      await this.telegramBot.sendMessage(this.telegramGroupId, message)
-      console.log(`📤 Sent to Telegram: ${event.title}`)
-    } catch (error) {
-      console.error('Telegram send error:', error)
+      city: event.city || '',
+      category: event.category || '',
+      likes: event.likes || 0,
+      createdAt: event.createdAt,
+      updatedAt: event.updatedAt,
+      status: event.status
     }
   }
 
-  cleanupCache() {
-    const targetSize = this.maxCacheSize * 0.8 // Очищаем до 80% от лимита
+  camelToSnake(str) {
+    return str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`)
+  }
 
-    if (this.currentCacheSize > targetSize) {
-      const neededSpace = this.currentCacheSize - targetSize
-      this.evictLRUEvents(neededSpace)
-      console.log(`🧹 Cache cleanup: freed ${this.formatBytes(neededSpace)}`)
+  // === ОЧИСТКА ===
+
+  startCleanupTasks() {
+    // Обновляем статистику каждые 5 минут
+    setInterval(async () => {
+      await this.updateStats()
+      
+      // Принудительная сборка мусора при высоком потреблении
+      const memUsage = process.memoryUsage().heapUsed
+      if (memUsage > 300 * 1024 * 1024) { // 300MB
+        console.log('🚨 High memory usage, forcing garbage collection')
+        global.gc && global.gc()
+      }
+
+      console.log(`📊 Stats: ${this.stats.totalEvents} events, ${this.wsClients.size} WS clients, ${Math.round(memUsage / 1024 / 1024)}MB RAM`)
+    }, 5 * 60 * 1000)
+
+    // Очистка неактивных WebSocket соединений
+    setInterval(() => {
+      this.wsClients.forEach(client => {
+        if (client.readyState !== WebSocket.OPEN) {
+          this.wsClients.delete(client)
+        }
+      })
+    }, 30 * 1000)
+
+    // Очистка старых событий (опционально)
+    if (this.db && process.env.ENABLE_CLEANUP === 'true') {
+      setInterval(async () => {
+        try {
+          const result = await this.db.query(`
+            UPDATE events 
+            SET status = 'archived'
+            WHERE status = 'active' 
+            AND created_at < NOW() - INTERVAL '30 days'
+            AND likes < 1
+          `)
+          
+          if (result.rowCount > 0) {
+            console.log(`🗂️ Archived ${result.rowCount} old events`)
+            await this.updateStats()
+          }
+        } catch (error) {
+          console.error('Cleanup error:', error)
+        }
+      }, 60 * 60 * 1000) // Каждый час
     }
   }
 }
 
 // === ЗАПУСК СЕРВЕРА ===
 
-const server = new DistributedEventServer()
+const server = new PostsServer()
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('🛑 Graceful shutdown...')
-  server.db.end()
-  if (server.redis) server.redis.quit()
+process.on('SIGTERM', async () => {
+  console.log('🛑 Posts server graceful shutdown...')
+  server.wss.close()
+  if (server.db) await server.db.end()
   process.exit(0)
 })
 
-process.on('SIGINT', () => {
-  console.log('🛑 Interrupted, shutting down...')
-  server.db.end()
-  if (server.redis) server.redis.quit()
+process.on('SIGINT', async () => {
+  console.log('🛑 Posts server interrupted, shutting down...')
+  server.wss.close()
+  if (server.db) await server.db.end()
   process.exit(0)
+})
+
+// Обработка uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('💥 Uncaught Exception:', error)
+  process.exit(1)
+})
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason)
+  process.exit(1)
 })
