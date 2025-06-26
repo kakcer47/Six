@@ -147,12 +147,13 @@ class PostsServer {
       try {
         const eventData = req.body
 
-        // Валидация
         if (!eventData.title || !eventData.description || !eventData.authorId) {
           return res.status(400).json({ error: 'Missing required fields' })
         }
 
         const event = await this.createEvent(eventData)
+
+        this.broadcastToClients('EVENT_CREATED', event)
 
         res.json(event)
         console.log(`✅ Event created: ${event.title} (${event.id})`)
@@ -163,9 +164,6 @@ class PostsServer {
       }
     })
 
-    this.broadcastToClients('EVENT_CREATED', event)
-
-    // Обновить событие
     this.app.put('/api/events/:id', async (req, res) => {
       try {
         const { id } = req.params
