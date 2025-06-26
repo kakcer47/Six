@@ -447,7 +447,7 @@ class PostsServer {
   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 `, [
         event.id, event.title, event.description, event.authorId,
-        event.authorName, event.author?.avatar, event.author?.username, event.author?.telegramId,
+        event.authorName, event.authorAvatar, event.authorUsername, event.authorTelegramId,
         event.city, event.category, event.gender, event.ageGroup, event.dateFrom, event.dateTo,
         event.likes, event.createdAt, event.updatedAt, event.status
       ])
@@ -459,7 +459,7 @@ class PostsServer {
     return this.formatEventForAPI(event)
   }
 
-  async getEvents({ page, limit, search, city, category, authorId, since }) {
+  async getEvents({ page, limit, search, city, category, gender, ageGroup, dateFrom, dateTo, authorId, since }) {
     let query = `
       SELECT * FROM events 
       WHERE status = 'active'
