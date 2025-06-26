@@ -110,10 +110,10 @@ class PostsServer {
           search,
           city,
           category,
-          gender,
-          ageGroup,
-          dateFrom,
-          dateTo,
+          gender,     
+          ageGroup,    
+          dateFrom,    
+          dateTo,     
           authorId,
           since
         } = req.query
