@@ -8,8 +8,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from sqlalchemy import create_engine, Column, Integer, BigInteger
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 # Enable logging
 logging.basicConfig(
@@ -40,9 +39,7 @@ ping_chat = int(os.getenv('PING_CHAT_ID'))  # ID of chat to ping
 restrict_perms = ChatPermissions(can_send_messages=False)
 allow_perms = ChatPermissions(
     can_send_messages=True,
-    can_send_media_messages=True,
     can_send_other_messages=True,
-    can_add_web_page_previews=True,
 )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
