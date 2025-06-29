@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from telegram import ChatPermissions, Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -17,7 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Database setup
-DATABASE_URL = os.getenv('DATABASE_URL')  # External database URL from env
+DATABASE_URL = os.getenv('DATABASE_URL')
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -33,60 +34,54 @@ Base.metadata.create_all(bind=engine)
 
 # Bot setup
 token = os.getenv('TELEGRAM_TOKEN')
-ping_chat = int(os.getenv('PING_CHAT_ID'))  # ID of chat to ping
+ping_chat = int(os.getenv('PING_CHAT_ID'))
 
-# Permissions objects
+# Permissions
 restrict_perms = ChatPermissions(can_send_messages=False)
-allow_perms = ChatPermissions(
-    can_send_messages=True,
-    can_send_other_messages=True,
-)
+allow_perms = ChatPermissions(can_send_messages=True, can_send_other_messages=True)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = SessionLocal()
     try:
-        user_id = update.effective_user.id
-        msg_id = update.message.message_id
-        # Add record if new
-        exists = session.query(MessageRecord).filter_by(message_id=msg_id).first()
-        if not exists:
-            session.add(MessageRecord(user_id=user_id, message_id=msg_id))
+        uid = update.effective_user.id
+        mid = update.message.message_id
+        if not session.query(MessageRecord).filter_by(message_id=mid).first():
+            session.add(MessageRecord(user_id=uid, message_id=mid))
             session.commit()
-        # Count
-        count = session.query(MessageRecord).filter_by(user_id=user_id).count()
+        count = session.query(MessageRecord).filter_by(user_id=uid).count()
         if count >= 3:
             await context.bot.restrict_chat_member(
                 chat_id=update.effective_chat.id,
-                user_id=user_id,
+                user_id=uid,
                 permissions=restrict_perms,
             )
-            logger.info(f"Restricted {user_id} (count={count})")
+            logger.info(f"Restricted {uid} (count={count})")
     except Exception as e:
         logger.error(e)
     finally:
         session.close()
 
-# NOTE: Telegram Bot API doesn't send deleted_message events. This is a placeholder.
 async def handle_deleted(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Real deletion tracking requires client API (Telethon) or webhook processing.
+    # Placeholder: deletion events not supported by Bot API
     pass
 
-async def ping(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await context.bot.send_message(chat_id=ping_chat, text='ping')
-        logger.info('Ping sent')
-    except Exception as e:
-        logger.error(e)
+async def ping_task(bot):
+    while True:
+        try:
+            await bot.send_message(chat_id=ping_chat, text='ping')
+            logger.info('Ping sent')
+        except Exception as e:
+            logger.error('Ping failed: %s', e)
+        await asyncio.sleep(25 * 60)
+
+async def main():
+    app = ApplicationBuilder().token(token).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Start ping task
+    asyncio.create_task(ping_task(app.bot))
+
+    await app.run_polling()
 
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(token).build()
-
-    # Handlers
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    # Placeholder for deletion handler
-    # app.add_handler(..., handle_deleted)
-
-    # Schedule ping
-    app.job_queue.run_repeating(ping, interval=25 * 60, first=0)
-
-    app.run_polling()
+    asyncio.run(main())
