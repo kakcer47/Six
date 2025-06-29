@@ -16,6 +16,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # Настройки
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002827106973"))  # ID супергруппы
+MODERATION_CHAT_ID = int(os.getenv("MODERATION_CHAT_ID", "0"))  # ID группы модерации
 EXAMPLE_URL = "https://example.com"  # Замените на свою ссылку
 
 # Логирование
@@ -105,6 +106,87 @@ async def delete_user_ad(message_id: int):
             (message_id,)
         )
         await db_connection.commit()
+
+async def delete_all_user_ads(user_id: int):
+    """Удалить все объявления пользователя"""
+    global db_connection
+    if db_connection:
+        # Получаем все объявления пользователя для удаления из чата
+        async with db_connection.execute(
+            "SELECT message_id FROM user_ads WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            messages = await cursor.fetchall()
+        
+        # Удаляем из чата
+        for (message_id,) in messages:
+            try:
+                await bot.delete_message(chat_id=TARGET_CHAT_ID, message_id=message_id)
+            except Exception as e:
+                logger.warning(f"Не удалось удалить сообщение {message_id}: {e}")
+        
+        # Удаляем из БД
+        await db_connection.execute(
+            "DELETE FROM user_ads WHERE user_id = ?",
+            (user_id,)
+        )
+        await db_connection.commit()
+        return len(messages)
+
+async def ban_user(user_id: int):
+    """Забанить пользователя"""
+    global db_connection
+    if db_connection:
+        await db_connection.execute(
+            "INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)",
+            (user_id,)
+        )
+        await db_connection.commit()
+
+async def unban_user(user_id: int):
+    """Разбанить пользователя"""
+    global db_connection
+    if db_connection:
+        await db_connection.execute(
+            "DELETE FROM banned_users WHERE user_id = ?",
+            (user_id,)
+        )
+        await db_connection.commit()
+
+async def is_user_banned(user_id: int) -> bool:
+    """Проверить, забанен ли пользователь"""
+    global db_connection
+    if db_connection:
+        async with db_connection.execute(
+            "SELECT 1 FROM banned_users WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            result = await cursor.fetchone()
+            return result is not None
+    return False
+
+async def send_to_moderation(user_id: int, username: str, text: str, message_url: str, topic_name: str):
+    """Отправить уведомление в группу модерации"""
+    if not MODERATION_CHAT_ID or MODERATION_CHAT_ID == 0:
+        return
+    
+    try:
+        username_text = f"@{username}" if username else "Нет username"
+        moderation_text = (
+            f"📋 Новое объявление:\n\n"
+            f"👤 ID: {user_id}\n"
+            f"🔗 Username: {username_text}\n"
+            f"📂 Тема: {topic_name}\n\n"
+            f"📝 Текст:\n{text}\n\n"
+            f"🔗 Ссылка: {message_url}"
+        )
+        
+        await bot.send_message(
+            chat_id=MODERATION_CHAT_ID,
+            text=moderation_text
+        )
+    except Exception as e:
+        logger.error(f"Ошибка отправки в модерацию: {e}")
 
 def get_ad_actions_keyboard(message_id: int, message_url: str):
     """Клавиатура действий с объявлением"""
@@ -225,15 +307,106 @@ async def get_my_ads_keyboard(user_id: int):
 @dp.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext):
     """Обработка команды /start"""
+    # Проверяем бан
+    if await is_user_banned(message.from_user.id):
+        await message.answer("🚫 Вы заблокированы в этом боте.")
+        return
+    
     await message.answer(
         "🌍 Выберите язык / Choose language:",
         reply_markup=get_language_keyboard()
     )
     await state.set_state(AdStates.choosing_language)
 
+# Команды модерации
+@dp.message(Command("ban"))
+async def ban_command(message: Message):
+    """Команда бана пользователя"""
+    if message.chat.id != MODERATION_CHAT_ID:
+        return
+    
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await message.answer("❌ Использование: /ban <user_id>")
+            return
+        
+        user_id = int(args[1])
+        await ban_user(user_id)
+        await message.answer(f"✅ Пользователь {user_id} забанен")
+        
+    except ValueError:
+        await message.answer("❌ Неверный ID пользователя")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(Command("banall"))
+async def banall_command(message: Message):
+    """Команда бана и удаления всех сообщений пользователя"""
+    if message.chat.id != MODERATION_CHAT_ID:
+        return
+    
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await message.answer("❌ Использование: /banall <user_id>")
+            return
+        
+        user_id = int(args[1])
+        
+        # Удаляем все объявления
+        deleted_count = await delete_all_user_ads(user_id)
+        
+        # Банем пользователя
+        await ban_user(user_id)
+        
+        await message.answer(
+            f"✅ Пользователь {user_id} забанен\n"
+            f"🗑 Удалено объявлений: {deleted_count}"
+        )
+        
+    except ValueError:
+        await message.answer("❌ Неверный ID пользователя")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(Command("banoff"))
+async def banoff_command(message: Message):
+    """Команда разбана пользователя"""
+    if message.chat.id != MODERATION_CHAT_ID:
+        return
+    
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await message.answer("❌ Использование: /banoff <user_id>")
+            return
+        
+        user_id = int(args[1])
+        
+        # Проверяем, забанен ли пользователь
+        if not await is_user_banned(user_id):
+            await message.answer(f"❌ Пользователь {user_id} не был забанен")
+            return
+        
+        # Разбаниваем пользователя
+        await unban_user(user_id)
+        
+        await message.answer(f"✅ Пользователь {user_id} разбанен")
+        
+    except ValueError:
+        await message.answer("❌ Неверный ID пользователя")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
 @dp.callback_query(F.data == "lang_ru", StateFilter(AdStates.choosing_language))
 async def language_ru_handler(callback: CallbackQuery, state: FSMContext):
     """Выбор русского языка"""
+    # Проверяем бан
+    if await is_user_banned(callback.from_user.id):
+        await callback.answer("🚫 Вы заблокированы в этом боте.", show_alert=True)
+        return
+    
     await callback.message.edit_text(
         "🏠 Главное меню:",
         reply_markup=get_main_menu_keyboard()
@@ -249,6 +422,11 @@ async def language_en_handler(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "create_ad")
 async def create_ad_handler(callback: CallbackQuery, state: FSMContext):
     """Создание объявления"""
+    # Проверяем бан
+    if await is_user_banned(callback.from_user.id):
+        await callback.answer("🚫 Вы заблокированы в этом боте.", show_alert=True)
+        return
+    
     await callback.message.edit_text(
         "📝 В какую тему хотите написать?",
         reply_markup=get_topics_keyboard()
@@ -259,6 +437,11 @@ async def create_ad_handler(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "my_ads")
 async def my_ads_handler(callback: CallbackQuery, state: FSMContext):
     """Мои объявления"""
+    # Проверяем бан
+    if await is_user_banned(callback.from_user.id):
+        await callback.answer("🚫 Вы заблокированы в этом боте.", show_alert=True)
+        return
+    
     user_id = callback.from_user.id
     ads = await get_user_ads(user_id)
     
@@ -367,6 +550,12 @@ async def topic_handler(callback: CallbackQuery, state: FSMContext):
 @dp.message(StateFilter(AdStates.writing_ad))
 async def ad_text_handler(message: Message, state: FSMContext):
     """Обработка текста объявления"""
+    # Проверяем бан
+    if await is_user_banned(message.from_user.id):
+        await message.answer("🚫 Вы заблокированы в этом боте.")
+        await state.clear()
+        return
+    
     user_data_state = await state.get_data()
     selected_topic = user_data_state.get("selected_topic")
     
@@ -397,17 +586,21 @@ async def ad_text_handler(message: Message, state: FSMContext):
     else:
         formatted_text = f"<blockquote>{ad_text}</blockquote>"
     
+    # Добавляем ссылку на автора в тире
+    if message.from_user.username:
+        contact_url = f"https://t.me/{message.from_user.username}"
+    else:
+        contact_url = f"tg://user?id={message.from_user.id}"
+    
+    formatted_text += f'\n\n<a href="{contact_url}">—</a>'
+    
     try:
         # Публикуем в группу
         sent_message = await bot.send_message(
             chat_id=TARGET_CHAT_ID,
             text=formatted_text,
             message_thread_id=topic_id,
-            parse_mode="HTML",
-            reply_markup=get_contact_keyboard(
-                message.from_user.id, 
-                message.from_user.username
-            )
+            parse_mode="HTML"
         )
         
         # Формируем ссылку на сообщение
@@ -418,6 +611,15 @@ async def ad_text_handler(message: Message, state: FSMContext):
             message.from_user.id, 
             sent_message.message_id, 
             message_url, 
+            topic_name
+        )
+        
+        # Отправляем в группу модерации
+        await send_to_moderation(
+            message.from_user.id,
+            message.from_user.username,
+            ad_text,
+            message_url,
             topic_name
         )
         
@@ -448,6 +650,11 @@ async def ad_text_handler(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "create_new")
 async def create_new_handler(callback: CallbackQuery, state: FSMContext):
     """Создание нового объявления"""
+    # Проверяем бан
+    if await is_user_banned(callback.from_user.id):
+        await callback.answer("🚫 Вы заблокированы в этом боте.", show_alert=True)
+        return
+    
     await callback.message.edit_text(
         "📝 В какую тему хотите написать?",
         reply_markup=get_topics_keyboard()
@@ -517,6 +724,11 @@ async def cancel_delete_handler(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("cancel_delete_"))
 async def cancel_delete_handler(callback: CallbackQuery, state: FSMContext):
     """Отмена удаления объявления"""
+    # Проверяем бан
+    if await is_user_banned(callback.from_user.id):
+        await callback.answer("🚫 Вы заблокированы в этом боте.", show_alert=True)
+        return
+    
     message_id = int(callback.data.split("_")[-1])
     ad_data = await get_ad_by_message_id(message_id)
     
@@ -537,6 +749,11 @@ async def cancel_delete_handler(callback: CallbackQuery, state: FSMContext):
 async def confirm_delete_handler(callback: CallbackQuery, state: FSMContext):
     """Подтверждение удаления объявления"""
     try:
+        # Проверяем бан
+        if await is_user_banned(callback.from_user.id):
+            await callback.answer("🚫 Вы заблокированы в этом боте.", show_alert=True)
+            return
+        
         message_id = int(callback.data.split("_")[-1])
         ad_data = await get_ad_by_message_id(message_id)
         
@@ -660,6 +877,11 @@ async def main():
             message_url TEXT NOT NULL,
             topic_name TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    await db_connection.execute("""
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id INTEGER PRIMARY KEY
         )
     """)
     await db_connection.commit()
