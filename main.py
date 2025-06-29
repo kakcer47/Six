@@ -165,6 +165,40 @@ async def is_user_banned(user_id: int) -> bool:
             return result is not None
     return False
 
+async def get_user_ad_count(user_id: int) -> int:
+    """Получить количество объявлений пользователя"""
+    global db_connection
+    if db_connection:
+        async with db_connection.execute(
+            "SELECT COUNT(*) FROM user_ads WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            result = await cursor.fetchone()
+            return result[0] if result else 0
+    return 0
+
+async def get_user_limit(user_id: int) -> int:
+    """Получить лимит объявлений для пользователя"""
+    global db_connection
+    if db_connection:
+        async with db_connection.execute(
+            "SELECT ad_limit FROM user_limits WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            result = await cursor.fetchone()
+            return result[0] if result else 4  # По умолчанию 4
+    return 4
+
+async def set_user_limit(user_id: int, limit: int):
+    """Установить лимит объявлений для пользователя"""
+    global db_connection
+    if db_connection:
+        await db_connection.execute(
+            "INSERT OR REPLACE INTO user_limits (user_id, ad_limit) VALUES (?, ?)",
+            (user_id, limit)
+        )
+        await db_connection.commit()
+
 async def send_to_moderation(user_id: int, username: str, text: str, message_url: str, topic_name: str):
     """Отправить уведомление в группу модерации"""
     if not MODERATION_CHAT_ID or MODERATION_CHAT_ID == 0:
@@ -318,11 +352,34 @@ async def start_handler(message: Message, state: FSMContext):
     )
     await state.set_state(AdStates.choosing_language)
 
+@dp.message(Command("start"))
+async def start_handler(message: Message, state: FSMContext):
+    """Обработка команды /start"""
+    # Блокируем команды из группы объявлений
+    if message.chat.id == TARGET_CHAT_ID:
+        return
+    
+    # Проверяем бан
+    if await is_user_banned(message.from_user.id):
+        await message.answer("🚫 Вы заблокированы в этом боте.")
+        return
+    
+    await message.answer(
+        "🌍 Выберите язык / Choose language:",
+        reply_markup=get_language_keyboard()
+    )
+    await state.set_state(AdStates.choosing_language)
+
 # Команды модерации
 @dp.message(Command("ban"))
 async def ban_command(message: Message):
     """Команда бана пользователя"""
-    if message.chat.id != MODERATION_CHAT_ID:
+    # Блокируем команды из группы объявлений
+    if message.chat.id == TARGET_CHAT_ID:
+        return
+    
+    # Работает только в группе модерации
+    if not MODERATION_CHAT_ID or message.chat.id != MODERATION_CHAT_ID:
         return
     
     try:
@@ -343,7 +400,12 @@ async def ban_command(message: Message):
 @dp.message(Command("banall"))
 async def banall_command(message: Message):
     """Команда бана и удаления всех сообщений пользователя"""
-    if message.chat.id != MODERATION_CHAT_ID:
+    # Блокируем команды из группы объявлений
+    if message.chat.id == TARGET_CHAT_ID:
+        return
+    
+    # Работает только в группе модерации
+    if not MODERATION_CHAT_ID or message.chat.id != MODERATION_CHAT_ID:
         return
     
     try:
@@ -373,7 +435,12 @@ async def banall_command(message: Message):
 @dp.message(Command("banoff"))
 async def banoff_command(message: Message):
     """Команда разбана пользователя"""
-    if message.chat.id != MODERATION_CHAT_ID:
+    # Блокируем команды из группы объявлений
+    if message.chat.id == TARGET_CHAT_ID:
+        return
+    
+    # Работает только в группе модерации
+    if not MODERATION_CHAT_ID or message.chat.id != MODERATION_CHAT_ID:
         return
     
     try:
@@ -393,6 +460,74 @@ async def banoff_command(message: Message):
         await unban_user(user_id)
         
         await message.answer(f"✅ Пользователь {user_id} разбанен")
+        
+    except ValueError:
+        await message.answer("❌ Неверный ID пользователя")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(Command("setlimit"))
+async def setlimit_command(message: Message):
+    """Команда установки лимита объявлений"""
+    # Блокируем команды из группы объявлений
+    if message.chat.id == TARGET_CHAT_ID:
+        return
+    
+    # Работает только в группе модерации
+    if not MODERATION_CHAT_ID or message.chat.id != MODERATION_CHAT_ID:
+        return
+    
+    try:
+        args = message.text.split()
+        if len(args) != 3:
+            await message.answer("❌ Использование: /setlimit <user_id> <limit>")
+            return
+        
+        user_id = int(args[1])
+        limit = int(args[2])
+        
+        if limit < 0:
+            await message.answer("❌ Лимит не может быть отрицательным")
+            return
+        
+        if limit > 50:
+            await message.answer("❌ Максимальный лимит: 50 объявлений")
+            return
+        
+        await set_user_limit(user_id, limit)
+        await message.answer(f"✅ Лимит для пользователя {user_id} установлен: {limit} объявлений")
+        
+    except ValueError:
+        await message.answer("❌ Неверные параметры. Используйте числа.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(Command("getlimit"))
+async def getlimit_command(message: Message):
+    """Команда получения лимита объявлений"""
+    # Блокируем команды из группы объявлений
+    if message.chat.id == TARGET_CHAT_ID:
+        return
+    
+    # Работает только в группе модерации
+    if not MODERATION_CHAT_ID or message.chat.id != MODERATION_CHAT_ID:
+        return
+    
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await message.answer("❌ Использование: /getlimit <user_id>")
+            return
+        
+        user_id = int(args[1])
+        current_count = await get_user_ad_count(user_id)
+        user_limit = await get_user_limit(user_id)
+        
+        await message.answer(
+            f"👤 Пользователь: {user_id}\n"
+            f"📊 Объявлений: {current_count}/{user_limit}\n"
+            f"🔢 Лимит: {user_limit}"
+        )
         
     except ValueError:
         await message.answer("❌ Неверный ID пользователя")
@@ -444,6 +579,7 @@ async def my_ads_handler(callback: CallbackQuery, state: FSMContext):
     
     user_id = callback.from_user.id
     ads = await get_user_ads(user_id)
+    user_limit = await get_user_limit(user_id)
     
     if not ads:
         await callback.answer("📭 У вас пока нет объявлений", show_alert=True)
@@ -451,7 +587,7 @@ async def my_ads_handler(callback: CallbackQuery, state: FSMContext):
     
     keyboard = await get_my_ads_keyboard(user_id)
     await callback.message.edit_text(
-        f"📋 Ваши объявления ({len(ads)}):",
+        f"📋 Ваши объявления ({len(ads)}/{user_limit}):",
         reply_markup=keyboard
     )
     await state.set_state(AdStates.my_ads)
@@ -507,6 +643,7 @@ async def back_to_my_ads_handler(callback: CallbackQuery, state: FSMContext):
     try:
         user_id = callback.from_user.id
         ads = await get_user_ads(user_id)
+        user_limit = await get_user_limit(user_id)
         
         if not ads:
             await callback.message.edit_text(
@@ -517,7 +654,7 @@ async def back_to_my_ads_handler(callback: CallbackQuery, state: FSMContext):
         else:
             keyboard = await get_my_ads_keyboard(user_id)
             await callback.message.edit_text(
-                f"📋 Ваши объявления ({len(ads)}):",
+                f"📋 Ваши объявления ({len(ads)}/{user_limit}):",
                 reply_markup=keyboard
             )
             await state.set_state(AdStates.my_ads)
@@ -550,9 +687,25 @@ async def topic_handler(callback: CallbackQuery, state: FSMContext):
 @dp.message(StateFilter(AdStates.writing_ad))
 async def ad_text_handler(message: Message, state: FSMContext):
     """Обработка текста объявления"""
+    # Блокируем из группы объявлений
+    if message.chat.id == TARGET_CHAT_ID:
+        return
+    
     # Проверяем бан
     if await is_user_banned(message.from_user.id):
         await message.answer("🚫 Вы заблокированы в этом боте.")
+        await state.clear()
+        return
+    
+    # Проверяем лимит перед публикацией
+    user_id = message.from_user.id
+    current_count = await get_user_ad_count(user_id)
+    user_limit = await get_user_limit(user_id)
+    
+    if current_count >= user_limit:
+        await message.answer(
+            f"❌ Превышен лимит объявлений!\n\nУ вас: {current_count}/{user_limit} объявлений\n\nУдалите старые объявления через /start → Мои объявления"
+        )
         await state.clear()
         return
     
@@ -623,9 +776,12 @@ async def ad_text_handler(message: Message, state: FSMContext):
             topic_name
         )
         
+        # Получаем обновленное количество объявлений
+        new_count = await get_user_ad_count(message.from_user.id)
+        
         # Уведомляем автора
         await message.answer(
-            "✅ Ваше объявление опубликовано!",
+            f"✅ Ваше объявление опубликовано!\n📊 Объявлений: {new_count}/{user_limit}",
             reply_markup=get_post_actions_keyboard(message.from_user.id, message_url)
         )
         
@@ -646,6 +802,16 @@ async def ad_text_handler(message: Message, state: FSMContext):
         await message.answer(error_msg)
     
     await state.clear()
+
+# Блокировка любых сообщений в группе объявлений
+@dp.message()
+async def block_target_chat_messages(message: Message):
+    """Блокировка сообщений в группе объявлений"""
+    if message.chat.id == TARGET_CHAT_ID:
+        return
+    
+    # Если сообщение не из группы объявлений, пропускаем
+    pass
 
 @dp.callback_query(F.data == "create_new")
 async def create_new_handler(callback: CallbackQuery, state: FSMContext):
@@ -779,6 +945,7 @@ async def confirm_delete_handler(callback: CallbackQuery, state: FSMContext):
         
         # Возвращаемся к списку объявлений
         ads = await get_user_ads(callback.from_user.id)
+        user_limit = await get_user_limit(callback.from_user.id)
         
         if not ads:
             await callback.message.edit_text(
@@ -790,7 +957,7 @@ async def confirm_delete_handler(callback: CallbackQuery, state: FSMContext):
         else:
             keyboard = await get_my_ads_keyboard(callback.from_user.id)
             await callback.message.edit_text(
-                f"✅ Объявление удалено!\n\n📋 Ваши объявления ({len(ads)}):",
+                f"✅ Объявление удалено!\n\n📋 Ваши объявления ({len(ads)}/{user_limit}):",
                 reply_markup=keyboard
             )
         
@@ -882,6 +1049,12 @@ async def main():
     await db_connection.execute("""
         CREATE TABLE IF NOT EXISTS banned_users (
             user_id INTEGER PRIMARY KEY
+        )
+    """)
+    await db_connection.execute("""
+        CREATE TABLE IF NOT EXISTS user_limits (
+            user_id INTEGER PRIMARY KEY,
+            ad_limit INTEGER NOT NULL DEFAULT 4
         )
     """)
     await db_connection.commit()
