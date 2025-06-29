@@ -85,6 +85,38 @@ async def get_user_ads(user_id: int):
             return await cursor.fetchall()
     return []
 
+async def get_ad_by_message_id(message_id: int):
+    """Получить объявление по message_id"""
+    global db_connection
+    if db_connection:
+        async with db_connection.execute(
+            "SELECT user_id, message_id, message_url, topic_name FROM user_ads WHERE message_id = ?",
+            (message_id,)
+        ) as cursor:
+            return await cursor.fetchone()
+    return None
+
+async def delete_user_ad(message_id: int):
+    """Удалить объявление из БД"""
+    global db_connection
+    if db_connection:
+        await db_connection.execute(
+            "DELETE FROM user_ads WHERE message_id = ?",
+            (message_id,)
+        )
+        await db_connection.commit()
+
+def get_ad_actions_keyboard(message_id: int, message_url: str):
+    """Клавиатура действий с объявлением"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_ad_{message_id}"),
+            InlineKeyboardButton(text="👁 Посмотреть", url=message_url)
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_my_ads")]
+    ])
+    return keyboard
+
 def get_language_keyboard():
     """Клавиатура выбора языка"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -98,10 +130,8 @@ def get_language_keyboard():
 def get_main_menu_keyboard():
     """Главное меню после выбора языка"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="➕ Создать", callback_data="create_ad"),
-            InlineKeyboardButton(text="📋 Мои объявления", callback_data="my_ads")
-        ]
+        [InlineKeyboardButton(text="📋 Мои объявления", callback_data="my_ads")],
+        [InlineKeyboardButton(text="➕ Создать", callback_data="create_ad")]
     ])
     return keyboard
 
@@ -176,7 +206,7 @@ async def get_my_ads_keyboard(user_id: int):
         buttons.append([
             InlineKeyboardButton(
                 text=f"📄 Объявление {i}", 
-                url=message_url
+                callback_data=f"view_ad_{message_id}"
             )
         ])
     
@@ -268,6 +298,27 @@ async def back_to_topics_handler(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_topics_keyboard()
     )
     await state.set_state(AdStates.choosing_topic)
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_my_ads")
+async def back_to_my_ads_handler(callback: CallbackQuery, state: FSMContext):
+    """Возврат к моим объявлениям"""
+    user_id = callback.from_user.id
+    ads = await get_user_ads(user_id)
+    
+    if not ads:
+        await callback.message.edit_text(
+            "🏠 Главное меню:",
+            reply_markup=get_main_menu_keyboard()
+        )
+        await state.set_state(AdStates.main_menu)
+    else:
+        keyboard = await get_my_ads_keyboard(user_id)
+        await callback.message.edit_text(
+            f"📋 Ваши объявления ({len(ads)}):",
+            reply_markup=keyboard
+        )
+        await state.set_state(AdStates.my_ads)
     await callback.answer()
 
 @dp.callback_query(StateFilter(AdStates.choosing_topic))
@@ -368,6 +419,95 @@ async def create_new_handler(callback: CallbackQuery, state: FSMContext):
     )
     await state.set_state(AdStates.choosing_topic)
     await callback.answer()
+
+@dp.callback_query(F.data.startswith("view_ad_"))
+async def view_ad_handler(callback: CallbackQuery, state: FSMContext):
+    """Просмотр действий с объявлением"""
+    message_id = int(callback.data.split("_")[-1])
+    ad_data = await get_ad_by_message_id(message_id)
+    
+    if not ad_data:
+        await callback.answer("❌ Объявление не найдено", show_alert=True)
+        return
+    
+    user_id, message_id, message_url, topic_name = ad_data
+    
+    # Проверяем, что объявление принадлежит пользователю
+    if user_id != callback.from_user.id:
+        await callback.answer("❌ Это не ваше объявление", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        f"📄 Объявление в теме: {topic_name}\n\nВыберите действие:",
+        reply_markup=get_ad_actions_keyboard(message_id, message_url)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delete_ad_"))
+async def delete_ad_handler(callback: CallbackQuery, state: FSMContext):
+    """Предупреждение об удалении объявления"""
+    message_id = int(callback.data.split("_")[-1])
+    
+    # Создаем клавиатуру подтверждения
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete_{message_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"view_ad_{message_id}")
+        ]
+    ])
+    
+    await callback.answer("⚠️ Вы точно хотите удалить это объявление?", show_alert=True)
+    
+    await callback.message.edit_text(
+        "⚠️ Подтвердите удаление объявления:\n\nЭто действие нельзя отменить!",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("confirm_delete_"))
+async def confirm_delete_handler(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение удаления объявления"""
+    message_id = int(callback.data.split("_")[-1])
+    ad_data = await get_ad_by_message_id(message_id)
+    
+    if not ad_data:
+        await callback.answer("❌ Объявление не найдено", show_alert=True)
+        return
+    
+    user_id, message_id, message_url, topic_name = ad_data
+    
+    # Проверяем, что объявление принадлежит пользователю
+    if user_id != callback.from_user.id:
+        await callback.answer("❌ Это не ваше объявление", show_alert=True)
+        return
+    
+    try:
+        # Пытаемся удалить сообщение из чата
+        await bot.delete_message(chat_id=TARGET_CHAT_ID, message_id=message_id)
+    except Exception as e:
+        logger.warning(f"Не удалось удалить сообщение {message_id} из чата: {e}")
+    
+    # Удаляем из БД
+    await delete_user_ad(message_id)
+    
+    # Возвращаемся к списку объявлений
+    ads = await get_user_ads(callback.from_user.id)
+    
+    if not ads:
+        await callback.message.edit_text(
+            "✅ Объявление удалено!\n\nУ вас больше нет объявлений.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_to_main")]
+            ])
+        )
+    else:
+        keyboard = await get_my_ads_keyboard(callback.from_user.id)
+        await callback.message.edit_text(
+            f"✅ Объявление удалено!\n\n📋 Ваши объявления ({len(ads)}):",
+            reply_markup=keyboard
+        )
+    
+    await callback.answer("✅ Объявление успешно удалено!", show_alert=True)
 
 async def set_bot_commands():
     """Установка команд бота"""
