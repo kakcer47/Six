@@ -1,8 +1,7 @@
 import asyncio
 import logging
 import os
-import sqlite3
-import aiosqlite
+import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, 
@@ -15,6 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # Настройки
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Новая переменная для БД
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002827106973"))  # ID супергруппы
 MODERATION_CHAT_ID = int(os.getenv("MODERATION_CHAT_ID", "0"))  # ID группы модерации
 EXAMPLE_URL = "https://example.com"  # Замените на свою ссылку
@@ -45,159 +45,215 @@ TOPICS = {
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# База данных в памяти
-async def init_db():
-    """Инициализация базы данных SQLite в памяти"""
-    async with aiosqlite.connect(":memory:") as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS user_ads (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                message_url TEXT NOT NULL,
-                topic_name TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.commit()
-        return db
+# Пул соединений с БД
+db_pool = None
 
-# Глобальная переменная для БД
-db_connection = None
+async def init_db():
+    """Инициализация базы данных PostgreSQL"""
+    global db_pool
+    
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL не установлен!")
+    
+    try:
+        # Создаем пул соединений
+        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        
+        # Создаем таблицы
+        async with db_pool.acquire() as connection:
+            # Таблица объявлений пользователей
+            await connection.execute("""
+                CREATE TABLE IF NOT EXISTS user_ads (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    message_url TEXT NOT NULL,
+                    topic_name TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Таблица забаненных пользователей
+            await connection.execute("""
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    user_id BIGINT PRIMARY KEY
+                )
+            """)
+            
+            # Таблица лимитов пользователей
+            await connection.execute("""
+                CREATE TABLE IF NOT EXISTS user_limits (
+                    user_id BIGINT PRIMARY KEY,
+                    ad_limit INTEGER NOT NULL DEFAULT 4
+                )
+            """)
+            
+            # Создаем индексы для оптимизации
+            await connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_ads_user_id ON user_ads(user_id)
+            """)
+            await connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_user_ads_message_id ON user_ads(message_id)
+            """)
+        
+        logger.info("✅ База данных успешно инициализирована")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации БД: {e}")
+        raise
 
 async def add_user_ad(user_id: int, message_id: int, message_url: str, topic_name: str):
     """Добавить объявление пользователя в БД"""
-    global db_connection
-    if db_connection:
-        await db_connection.execute(
-            "INSERT INTO user_ads (user_id, message_id, message_url, topic_name) VALUES (?, ?, ?, ?)",
-            (user_id, message_id, message_url, topic_name)
-        )
-        await db_connection.commit()
+    try:
+        async with db_pool.acquire() as connection:
+            await connection.execute(
+                "INSERT INTO user_ads (user_id, message_id, message_url, topic_name) VALUES ($1, $2, $3, $4)",
+                user_id, message_id, message_url, topic_name
+            )
+    except Exception as e:
+        logger.error(f"Ошибка добавления объявления: {e}")
 
 async def get_user_ads(user_id: int):
     """Получить объявления пользователя"""
-    global db_connection
-    if db_connection:
-        async with db_connection.execute(
-            "SELECT message_id, message_url, topic_name FROM user_ads WHERE user_id = ? ORDER BY created_at DESC",
-            (user_id,)
-        ) as cursor:
-            return await cursor.fetchall()
-    return []
+    try:
+        async with db_pool.acquire() as connection:
+            rows = await connection.fetch(
+                "SELECT message_id, message_url, topic_name FROM user_ads WHERE user_id = $1 ORDER BY created_at DESC",
+                user_id
+            )
+            return [(row['message_id'], row['message_url'], row['topic_name']) for row in rows]
+    except Exception as e:
+        logger.error(f"Ошибка получения объявлений: {e}")
+        return []
 
 async def get_ad_by_message_id(message_id: int):
     """Получить объявление по message_id"""
-    global db_connection
-    if db_connection:
-        async with db_connection.execute(
-            "SELECT user_id, message_id, message_url, topic_name FROM user_ads WHERE message_id = ?",
-            (message_id,)
-        ) as cursor:
-            return await cursor.fetchone()
-    return None
+    try:
+        async with db_pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT user_id, message_id, message_url, topic_name FROM user_ads WHERE message_id = $1",
+                message_id
+            )
+            if row:
+                return (row['user_id'], row['message_id'], row['message_url'], row['topic_name'])
+            return None
+    except Exception as e:
+        logger.error(f"Ошибка получения объявления: {e}")
+        return None
 
 async def delete_user_ad(message_id: int):
     """Удалить объявление из БД"""
-    global db_connection
-    if db_connection:
-        await db_connection.execute(
-            "DELETE FROM user_ads WHERE message_id = ?",
-            (message_id,)
-        )
-        await db_connection.commit()
+    try:
+        async with db_pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM user_ads WHERE message_id = $1",
+                message_id
+            )
+    except Exception as e:
+        logger.error(f"Ошибка удаления объявления: {e}")
 
 async def delete_all_user_ads(user_id: int):
     """Удалить все объявления пользователя"""
-    global db_connection
-    if db_connection:
-        # Получаем все объявления пользователя для удаления из чата
-        async with db_connection.execute(
-            "SELECT message_id FROM user_ads WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
-            messages = await cursor.fetchall()
-        
-        # Удаляем из чата
-        for (message_id,) in messages:
-            try:
-                await bot.delete_message(chat_id=TARGET_CHAT_ID, message_id=message_id)
-            except Exception as e:
-                logger.warning(f"Не удалось удалить сообщение {message_id}: {e}")
-        
-        # Удаляем из БД
-        await db_connection.execute(
-            "DELETE FROM user_ads WHERE user_id = ?",
-            (user_id,)
-        )
-        await db_connection.commit()
-        return len(messages)
+    try:
+        async with db_pool.acquire() as connection:
+            # Получаем все объявления пользователя для удаления из чата
+            rows = await connection.fetch(
+                "SELECT message_id FROM user_ads WHERE user_id = $1",
+                user_id
+            )
+            
+            # Удаляем из чата
+            deleted_count = 0
+            for row in rows:
+                message_id = row['message_id']
+                try:
+                    await bot.delete_message(chat_id=TARGET_CHAT_ID, message_id=message_id)
+                    deleted_count += 1
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить сообщение {message_id}: {e}")
+            
+            # Удаляем из БД
+            await connection.execute(
+                "DELETE FROM user_ads WHERE user_id = $1",
+                user_id
+            )
+            
+            return deleted_count
+    except Exception as e:
+        logger.error(f"Ошибка удаления всех объявлений: {e}")
+        return 0
 
 async def ban_user(user_id: int):
     """Забанить пользователя"""
-    global db_connection
-    if db_connection:
-        await db_connection.execute(
-            "INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)",
-            (user_id,)
-        )
-        await db_connection.commit()
+    try:
+        async with db_pool.acquire() as connection:
+            await connection.execute(
+                "INSERT INTO banned_users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+                user_id
+            )
+    except Exception as e:
+        logger.error(f"Ошибка бана пользователя: {e}")
 
 async def unban_user(user_id: int):
     """Разбанить пользователя"""
-    global db_connection
-    if db_connection:
-        await db_connection.execute(
-            "DELETE FROM banned_users WHERE user_id = ?",
-            (user_id,)
-        )
-        await db_connection.commit()
+    try:
+        async with db_pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM banned_users WHERE user_id = $1",
+                user_id
+            )
+    except Exception as e:
+        logger.error(f"Ошибка разбана пользователя: {e}")
 
 async def is_user_banned(user_id: int) -> bool:
     """Проверить, забанен ли пользователь"""
-    global db_connection
-    if db_connection:
-        async with db_connection.execute(
-            "SELECT 1 FROM banned_users WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
-            result = await cursor.fetchone()
+    try:
+        async with db_pool.acquire() as connection:
+            result = await connection.fetchval(
+                "SELECT 1 FROM banned_users WHERE user_id = $1",
+                user_id
+            )
             return result is not None
-    return False
+    except Exception as e:
+        logger.error(f"Ошибка проверки бана: {e}")
+        return False
 
 async def get_user_ad_count(user_id: int) -> int:
     """Получить количество объявлений пользователя"""
-    global db_connection
-    if db_connection:
-        async with db_connection.execute(
-            "SELECT COUNT(*) FROM user_ads WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
-            result = await cursor.fetchone()
-            return result[0] if result else 0
-    return 0
+    try:
+        async with db_pool.acquire() as connection:
+            result = await connection.fetchval(
+                "SELECT COUNT(*) FROM user_ads WHERE user_id = $1",
+                user_id
+            )
+            return result if result else 0
+    except Exception as e:
+        logger.error(f"Ошибка подсчета объявлений: {e}")
+        return 0
 
 async def get_user_limit(user_id: int) -> int:
     """Получить лимит объявлений для пользователя"""
-    global db_connection
-    if db_connection:
-        async with db_connection.execute(
-            "SELECT ad_limit FROM user_limits WHERE user_id = ?",
-            (user_id,)
-        ) as cursor:
-            result = await cursor.fetchone()
-            return result[0] if result else 4  # По умолчанию 4
-    return 4
+    try:
+        async with db_pool.acquire() as connection:
+            result = await connection.fetchval(
+                "SELECT ad_limit FROM user_limits WHERE user_id = $1",
+                user_id
+            )
+            return result if result else 4  # По умолчанию 4
+    except Exception as e:
+        logger.error(f"Ошибка получения лимита: {e}")
+        return 4
 
 async def set_user_limit(user_id: int, limit: int):
     """Установить лимит объявлений для пользователя"""
-    global db_connection
-    if db_connection:
-        await db_connection.execute(
-            "INSERT OR REPLACE INTO user_limits (user_id, ad_limit) VALUES (?, ?)",
-            (user_id, limit)
-        )
-        await db_connection.commit()
+    try:
+        async with db_pool.acquire() as connection:
+            await connection.execute(
+                "INSERT INTO user_limits (user_id, ad_limit) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET ad_limit = $2",
+                user_id, limit
+            )
+    except Exception as e:
+        logger.error(f"Ошибка установки лимита: {e}")
 
 async def send_to_moderation(user_id: int, username: str, text: str, message_url: str, topic_name: str):
     """Отправить уведомление в группу модерации"""
@@ -337,20 +393,6 @@ async def get_my_ads_keyboard(user_id: int):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     return keyboard
-
-@dp.message(Command("start"))
-async def start_handler(message: Message, state: FSMContext):
-    """Обработка команды /start"""
-    # Проверяем бан
-    if await is_user_banned(message.from_user.id):
-        await message.answer("🚫 Вы заблокированы в этом боте.")
-        return
-    
-    await message.answer(
-        "🌍 Выберите язык / Choose language:",
-        reply_markup=get_language_keyboard()
-    )
-    await state.set_state(AdStates.choosing_language)
 
 @dp.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext):
@@ -873,23 +915,6 @@ async def delete_ad_handler(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("cancel_delete_"))
 async def cancel_delete_handler(callback: CallbackQuery, state: FSMContext):
     """Отмена удаления объявления"""
-    message_id = int(callback.data.split("_")[-1])
-    ad_data = await get_ad_by_message_id(message_id)
-    
-    if not ad_data:
-        await callback.answer("❌ Объявление не найдено", show_alert=True)
-        return
-    
-    user_id, message_id, message_url, topic_name = ad_data
-    
-    # Возвращаемся к просмотру объявления
-    await callback.message.edit_text(
-        f"📄 Объявление в теме: {topic_name}\n\nВыберите действие:",
-        reply_markup=get_ad_actions_keyboard(message_id, message_url)
-    )
-@dp.callback_query(F.data.startswith("cancel_delete_"))
-async def cancel_delete_handler(callback: CallbackQuery, state: FSMContext):
-    """Отмена удаления объявления"""
     # Проверяем бан
     if await is_user_banned(callback.from_user.id):
         await callback.answer("🚫 Вы заблокированы в этом боте.", show_alert=True)
@@ -969,57 +994,6 @@ async def confirm_delete_handler(callback: CallbackQuery, state: FSMContext):
             await callback.answer("❌ Ошибка при удалении", show_alert=True)
         except:
             pass
-async def confirm_delete_handler(callback: CallbackQuery, state: FSMContext):
-    """Подтверждение удаления объявления"""
-    try:
-        message_id = int(callback.data.split("_")[-1])
-        ad_data = await get_ad_by_message_id(message_id)
-        
-        if not ad_data:
-            await callback.answer("❌ Объявление не найдено", show_alert=True)
-            return
-        
-        user_id, message_id, message_url, topic_name = ad_data
-        
-        # Проверяем, что объявление принадлежит пользователю
-        if user_id != callback.from_user.id:
-            await callback.answer("❌ Это не ваше объявление", show_alert=True)
-            return
-        
-        try:
-            # Пытаемся удалить сообщение из чата
-            await bot.delete_message(chat_id=TARGET_CHAT_ID, message_id=message_id)
-        except Exception as e:
-            logger.warning(f"Не удалось удалить сообщение {message_id} из чата: {e}")
-        
-        # Удаляем из БД
-        await delete_user_ad(message_id)
-        
-        # Возвращаемся к списку объявлений
-        ads = await get_user_ads(callback.from_user.id)
-        
-        if not ads:
-            await callback.message.edit_text(
-                "✅ Объявление удалено!\n\nУ вас больше нет объявлений.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_to_main")]
-                ])
-            )
-        else:
-            keyboard = await get_my_ads_keyboard(callback.from_user.id)
-            await callback.message.edit_text(
-                f"✅ Объявление удалено!\n\n📋 Ваши объявления ({len(ads)}):",
-                reply_markup=keyboard
-            )
-        
-        await callback.answer("✅ Объявление успешно удалено!", show_alert=True)
-        
-    except Exception as e:
-        logger.error(f"Ошибка при удалении объявления: {e}")
-        try:
-            await callback.answer("❌ Ошибка при удалении", show_alert=True)
-        except:
-            pass
 
 async def set_bot_commands():
     """Установка команд бота"""
@@ -1030,45 +1004,26 @@ async def set_bot_commands():
 
 async def main():
     """Главная функция"""
-    global db_connection
-    
     logger.info("🚀 Запуск бота объявлений...")
     
-    # Инициализируем БД
-    db_connection = await aiosqlite.connect(":memory:")
-    await db_connection.execute("""
-        CREATE TABLE IF NOT EXISTS user_ads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            message_id INTEGER NOT NULL,
-            message_url TEXT NOT NULL,
-            topic_name TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    await db_connection.execute("""
-        CREATE TABLE IF NOT EXISTS banned_users (
-            user_id INTEGER PRIMARY KEY
-        )
-    """)
-    await db_connection.execute("""
-        CREATE TABLE IF NOT EXISTS user_limits (
-            user_id INTEGER PRIMARY KEY,
-            ad_limit INTEGER NOT NULL DEFAULT 4
-        )
-    """)
-    await db_connection.commit()
-    
-    # Устанавливаем команды
-    await set_bot_commands()
-    
     try:
+        # Инициализируем БД
+        await init_db()
+        
+        # Устанавливаем команды
+        await set_bot_commands()
+        
         # Запускаем бота
         await dp.start_polling(bot)
+        
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка: {e}")
+        raise
     finally:
-        # Закрываем соединение с БД
-        if db_connection:
-            await db_connection.close()
+        # Закрываем пул соединений
+        if db_pool:
+            await db_pool.close()
+            logger.info("📊 Соединение с БД закрыто")
 
 if __name__ == "__main__":
     asyncio.run(main())
