@@ -22,7 +22,7 @@ async def count_user_messages(chat_id, user_id):
             count += 1
     return count
 
-@app.on_message(filters.group & ~filters.command)
+@app.on_message(filters.group & filters.text)
 async def handle_message(client, message: Message):
     """Обработка нового сообщения"""
     user_id = message.from_user.id
