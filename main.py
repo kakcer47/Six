@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import asyncpg
+from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, 
@@ -14,10 +15,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # Настройки
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # Новая переменная для БД
+DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL URL
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002827106973"))  # ID супергруппы
 MODERATION_CHAT_ID = int(os.getenv("MODERATION_CHAT_ID", "0"))  # ID группы модерации
-EXAMPLE_URL = "https://example.com"  # Замените на свою ссылку
+GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/your_group")  # Ссылка на группу
+EXAMPLE_URL = os.getenv("EXAMPLE_URL", "https://example.com")  # Ссылка на пример
+PORT = int(os.getenv("PORT", 8080))  # Порт для веб-сервера
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +50,29 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # Пул соединений с БД
 db_pool = None
+
+# Веб-приложение для Render
+app = web.Application()
+
+async def health_check(request):
+    """Проверка здоровья сервиса"""
+    return web.Response(text="Bot is running!")
+
+async def ping_self():
+    """Автопинг для предотвращения засыпания"""
+    url = f"https://your-render-app.onrender.com"  # Замените на ваш URL
+    try:
+        async with ClientSession() as session:
+            async with session.get(url) as response:
+                logger.info(f"Self ping: {response.status}")
+    except Exception as e:
+        logger.warning(f"Self ping failed: {e}")
+
+async def start_ping_task():
+    """Запуск задачи автопинга каждые 14 минут"""
+    while True:
+        await asyncio.sleep(840)  # 14 минут
+        await ping_self()
 
 async def init_db():
     """Инициализация базы данных PostgreSQL"""
@@ -306,7 +332,15 @@ def get_main_menu_keyboard():
             InlineKeyboardButton(text="➕ Создать", callback_data="create_ad"),
             InlineKeyboardButton(text="📋 Мои объявления", callback_data="my_ads")
         ],
+        [InlineKeyboardButton(text="🔗 Перейти в группу", url=GROUP_LINK)],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_language")]
+    ])
+    return keyboard
+
+def get_back_to_main_keyboard():
+    """Клавиатура с кнопкой 'На главную'"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 На главную", callback_data="back_to_main")]
     ])
     return keyboard
 
@@ -746,7 +780,8 @@ async def ad_text_handler(message: Message, state: FSMContext):
     
     if current_count >= user_limit:
         await message.answer(
-            f"❌ Превышен лимит объявлений!\n\nУ вас: {current_count}/{user_limit} объявлений\n\nУдалите старые объявления через /start → Мои объявления"
+            f"❌ Превышен лимит объявлений!\n\nУ вас: {current_count}/{user_limit} объявлений\n\nУдалите старые объявления через /start → Мои объявления",
+            reply_markup=get_back_to_main_keyboard()
         )
         await state.clear()
         return
@@ -1002,6 +1037,18 @@ async def set_bot_commands():
     ]
     await bot.set_my_commands(commands)
 
+async def start_web_server():
+    """Запуск веб-сервера для Render"""
+    app.router.add_get('/health', health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    
+    logger.info(f"🌐 Веб-сервер запущен на порту {PORT}")
+
 async def main():
     """Главная функция"""
     logger.info("🚀 Запуск бота объявлений...")
@@ -1013,7 +1060,14 @@ async def main():
         # Устанавливаем команды
         await set_bot_commands()
         
+        # Запускаем веб-сервер
+        await start_web_server()
+        
+        # Запускаем задачу автопинга
+        asyncio.create_task(start_ping_task())
+        
         # Запускаем бота
+        logger.info("✅ Все сервисы запущены")
         await dp.start_polling(bot)
         
     except Exception as e:
