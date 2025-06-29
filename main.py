@@ -184,7 +184,8 @@ def get_post_actions_keyboard(user_id: int, message_url: str):
         [
             InlineKeyboardButton(text="➕ Создать", callback_data="create_new"),
             InlineKeyboardButton(text="👁 Посмотреть", url=message_url)
-        ]
+        ],
+        [InlineKeyboardButton(text="📋 Мои объявления", callback_data="my_ads")]
     ])
     return keyboard
 
@@ -245,7 +246,7 @@ async def language_en_handler(callback: CallbackQuery, state: FSMContext):
     """Выбор английского языка (заглушка)"""
     await callback.answer("🚧 English version coming soon!", show_alert=True)
 
-@dp.callback_query(F.data == "create_ad", StateFilter(AdStates.main_menu))
+@dp.callback_query(F.data == "create_ad")
 async def create_ad_handler(callback: CallbackQuery, state: FSMContext):
     """Создание объявления"""
     await callback.message.edit_text(
@@ -255,7 +256,7 @@ async def create_ad_handler(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdStates.choosing_topic)
     await callback.answer()
 
-@dp.callback_query(F.data == "my_ads", StateFilter(AdStates.main_menu))
+@dp.callback_query(F.data == "my_ads")
 async def my_ads_handler(callback: CallbackQuery, state: FSMContext):
     """Мои объявления"""
     user_id = callback.from_user.id
@@ -479,26 +480,111 @@ async def view_ad_handler(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("delete_ad_"))
 async def delete_ad_handler(callback: CallbackQuery, state: FSMContext):
-    """Предупреждение об удалении объявления"""
+    """Системное уведомление об удалении объявления"""
     message_id = int(callback.data.split("_")[-1])
     
-    # Создаем клавиатуру подтверждения
+    # Создаем клавиатуру для системного уведомления
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete_{message_id}"),
-            InlineKeyboardButton(text="❌ Отмена", callback_data=f"view_ad_{message_id}")
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel_delete_{message_id}"),
+            InlineKeyboardButton(text="✅ ОК", callback_data=f"confirm_delete_{message_id}")
         ]
     ])
     
-    await callback.answer("⚠️ Вы точно хотите удалить это объявление?", show_alert=True)
-    
     await callback.message.edit_text(
-        "⚠️ Подтвердите удаление объявления:\n\nЭто действие нельзя отменить!",
+        "⚠️ Вы точно хотите удалить это объявление?\n\nЭто действие нельзя отменить!",
         reply_markup=keyboard
     )
-    await callback.answer()
+    await callback.answer("⚠️ Подтвердите удаление объявления", show_alert=True)
+
+@dp.callback_query(F.data.startswith("cancel_delete_"))
+async def cancel_delete_handler(callback: CallbackQuery, state: FSMContext):
+    """Отмена удаления объявления"""
+    message_id = int(callback.data.split("_")[-1])
+    ad_data = await get_ad_by_message_id(message_id)
+    
+    if not ad_data:
+        await callback.answer("❌ Объявление не найдено", show_alert=True)
+        return
+    
+    user_id, message_id, message_url, topic_name = ad_data
+    
+    # Возвращаемся к просмотру объявления
+    await callback.message.edit_text(
+        f"📄 Объявление в теме: {topic_name}\n\nВыберите действие:",
+        reply_markup=get_ad_actions_keyboard(message_id, message_url)
+    )
+@dp.callback_query(F.data.startswith("cancel_delete_"))
+async def cancel_delete_handler(callback: CallbackQuery, state: FSMContext):
+    """Отмена удаления объявления"""
+    message_id = int(callback.data.split("_")[-1])
+    ad_data = await get_ad_by_message_id(message_id)
+    
+    if not ad_data:
+        await callback.answer("❌ Объявление не найдено", show_alert=True)
+        return
+    
+    user_id, message_id, message_url, topic_name = ad_data
+    
+    # Возвращаемся к просмотру объявления
+    await callback.message.edit_text(
+        f"📄 Объявление в теме: {topic_name}\n\nВыберите действие:",
+        reply_markup=get_ad_actions_keyboard(message_id, message_url)
+    )
+    await callback.answer("Удаление отменено")
 
 @dp.callback_query(F.data.startswith("confirm_delete_"))
+async def confirm_delete_handler(callback: CallbackQuery, state: FSMContext):
+    """Подтверждение удаления объявления"""
+    try:
+        message_id = int(callback.data.split("_")[-1])
+        ad_data = await get_ad_by_message_id(message_id)
+        
+        if not ad_data:
+            await callback.answer("❌ Объявление не найдено", show_alert=True)
+            return
+        
+        user_id, message_id, message_url, topic_name = ad_data
+        
+        # Проверяем, что объявление принадлежит пользователю
+        if user_id != callback.from_user.id:
+            await callback.answer("❌ Это не ваше объявление", show_alert=True)
+            return
+        
+        try:
+            # Пытаемся удалить сообщение из чата
+            await bot.delete_message(chat_id=TARGET_CHAT_ID, message_id=message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение {message_id} из чата: {e}")
+        
+        # Удаляем из БД
+        await delete_user_ad(message_id)
+        
+        # Возвращаемся к списку объявлений
+        ads = await get_user_ads(callback.from_user.id)
+        
+        if not ads:
+            await callback.message.edit_text(
+                "✅ Объявление удалено!\n\nУ вас больше нет объявлений.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_to_main")]
+                ])
+            )
+        else:
+            keyboard = await get_my_ads_keyboard(callback.from_user.id)
+            await callback.message.edit_text(
+                f"✅ Объявление удалено!\n\n📋 Ваши объявления ({len(ads)}):",
+                reply_markup=keyboard
+            )
+        
+        await callback.answer("✅ Объявление успешно удалено!", show_alert=True)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при удалении объявления: {e}")
+        try:
+            await callback.answer("❌ Ошибка при удалении", show_alert=True)
+        except:
+            pass
 async def confirm_delete_handler(callback: CallbackQuery, state: FSMContext):
     """Подтверждение удаления объявления"""
     try:
