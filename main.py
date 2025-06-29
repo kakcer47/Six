@@ -60,7 +60,7 @@ async def health_check(request):
 
 async def ping_self():
     """Автопинг для предотвращения засыпания"""
-    url = f"https://your-render-app.onrender.com"  # Замените на ваш URL
+    url = f"https://six-o46c.onrender.com"  # Замените на ваш URL
     try:
         async with ClientSession() as session:
             async with session.get(url) as response:
