@@ -14,7 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # Настройки
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002827106973"))  # ID супергруппы
-EXAMPLE_URL = "https://example.com"  # Замените на свою ссылку
+EXAMPLE_URL = "https://telegra.ph/sadf-06-29-2"  # Замените на свою ссылку
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -28,17 +28,16 @@ class AdStates(StatesGroup):
 
 # Темы группы - НАСТРОЙТЕ ПОД СВОЮ ГРУППУ
 TOPICS = {
-    "topic_1": {"name": "💼 Работа", "id": 27},  # ID темы в группе
-    "topic_2": {"name": "🏠 Недвижимость", "id": 29},
-    "topic_3": {"name": "🚗 Авто", "id": 30},
-    "topic_4": {"name": "🛍️ Товары", "id": 31},
-    "topic_5": {"name": "💡 Услуги", "id": 32},
-    "topic_6": {"name": "📚 Обучение", "id": 38},
+    "topic_1": {"name": "💼 Работа", "id": 27},
+    "topic_2": {"name": "🏠 Недвижимость", "id": 28},
+    "topic_3": {"name": "🚗 Авто", "id": 29},
+    "topic_4": {"name": "🛍️ Товары", "id": 30},  # Добавьте свои ID
+    "topic_5": {"name": "💡 Услуги", "id": 31},
+    "topic_6": {"name": "📚 Обучение", "id": 32},
 }
 
 # Хранилище пользователей (в продакшене используйте БД)
 user_data = {}
-started_users = set()
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -64,7 +63,7 @@ def get_topics_keyboard():
         topic_key, topic_data = topic_items[i]
         row.append(InlineKeyboardButton(
             text=topic_data["name"], 
-            callback_data=f"topic_{topic_key}"
+            callback_data=topic_key
         ))
         
         # Вторая кнопка в ряду (если есть)
@@ -72,10 +71,15 @@ def get_topics_keyboard():
             topic_key2, topic_data2 = topic_items[i + 1]
             row.append(InlineKeyboardButton(
                 text=topic_data2["name"], 
-                callback_data=f"topic_{topic_key2}"
+                callback_data=topic_key2
             ))
         
         buttons.append(row)
+    
+    # Добавляем кнопку "Назад"
+    buttons.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_language")
+    ])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     return keyboard
@@ -112,15 +116,6 @@ def get_contact_keyboard(user_id: int, username: str = None):
 @dp.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext):
     """Обработка команды /start"""
-    user_id = message.from_user.id
-    
-    # Если пользователь уже стартовал - игнорируем
-    if user_id in started_users:
-        return
-    
-    # Добавляем в список стартовавших
-    started_users.add(user_id)
-    
     await message.answer(
         "🌍 Выберите язык / Choose language:",
         reply_markup=get_language_keyboard()
@@ -142,10 +137,20 @@ async def language_en_handler(callback: CallbackQuery, state: FSMContext):
     """Выбор английского языка (заглушка)"""
     await callback.answer("🚧 English version coming soon!", show_alert=True)
 
-@dp.callback_query(F.data.startswith("topic_"), StateFilter(AdStates.choosing_topic))
+@dp.callback_query(F.data == "back_to_language")
+async def back_to_language_handler(callback: CallbackQuery, state: FSMContext):
+    """Возврат к выбору языка"""
+    await callback.message.edit_text(
+        "🌍 Выберите язык / Choose language:",
+        reply_markup=get_language_keyboard()
+    )
+    await state.set_state(AdStates.choosing_language)
+    await callback.answer()
+
+@dp.callback_query(StateFilter(AdStates.choosing_topic))
 async def topic_handler(callback: CallbackQuery, state: FSMContext):
     """Выбор темы"""
-    topic_key = callback.data.replace("topic_", "")
+    topic_key = callback.data
     
     if topic_key in TOPICS:
         # Сохраняем выбранную тему
