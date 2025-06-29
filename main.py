@@ -1,236 +1,252 @@
-import os
 import asyncio
 import logging
-from pyrogram import Client, filters
-from pyrogram.types import Message, ChatPermissions
-from pyrogram.errors import (
-    ChatAdminRequired, 
-    UserAdminInvalid, 
-    FloodWait,
-    PeerIdInvalid
+import os
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, 
+    InlineKeyboardButton, BotCommand
 )
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Настройки
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002827106973"))  # ID супергруппы
+EXAMPLE_URL = "https://example.com"  # Замените на свою ссылку
+
+# Логирование
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Конфигурация из переменных окружения
-API_ID = int(os.getenv('API_ID'))
-API_HASH = os.getenv('API_HASH')
-PHONE = os.getenv('PHONE_NUMBER')
-TARGET_CHAT_ID = int(os.getenv('TARGET_CHAT_ID'))
+# Состояния
+class AdStates(StatesGroup):
+    choosing_language = State()
+    choosing_topic = State() 
+    writing_ad = State()
 
-# Клиент
-app = Client("user_account", api_id=API_ID, api_hash=API_HASH, phone_number=PHONE)
+# Темы группы - НАСТРОЙТЕ ПОД СВОЮ ГРУППУ
+TOPICS = {
+    "topic_1": {"name": "💼 Работа", "id": 123},  # ID темы в группе
+    "topic_2": {"name": "🏠 Недвижимость", "id": 456},
+    "topic_3": {"name": "🚗 Авто", "id": 789},
+    "topic_4": {"name": "🛍️ Товары", "id": 101112},
+    "topic_5": {"name": "💡 Услуги", "id": 131415},
+    "topic_6": {"name": "📚 Обучение", "id": 161718},
+}
 
-# Настройки прав
-restricted = ChatPermissions(can_send_messages=False)
-unrestricted = ChatPermissions(
-    can_send_messages=True,
-    can_send_media_messages=True,
-    can_send_polls=True,
-    can_send_other_messages=True,
-    can_add_web_page_previews=True,
-    can_invite_users=True
-)
+# Хранилище пользователей (в продакшене используйте БД)
+user_data = {}
+started_users = set()
 
-processing_lock = asyncio.Lock()
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
-async def count_user_messages_fast(chat_id: int, user_id: int) -> int:
-    """Быстрый подсчет сообщений конкретного пользователя"""
-    try:
-        count = 0
-        logger.info(f"🔍 Поиск сообщений пользователя {user_id}")
+def get_language_keyboard():
+    """Клавиатура выбора языка"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru"),
+            InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")
+        ]
+    ])
+    return keyboard
+
+def get_topics_keyboard():
+    """Клавиатура выбора тем (по 2 на линию)"""
+    buttons = []
+    topic_items = list(TOPICS.items())
+    
+    for i in range(0, len(topic_items), 2):
+        row = []
+        # Первая кнопка в ряду
+        topic_key, topic_data = topic_items[i]
+        row.append(InlineKeyboardButton(
+            text=topic_data["name"], 
+            callback_data=f"topic_{topic_key}"
+        ))
         
-        # Ищем сообщения только этого пользователя
-        async for message in app.search_messages(chat_id, from_user=user_id):
-            count += 1
-            
-            # Логируем каждые 100 сообщений
-            if count % 100 == 0:
-                logger.info(f"📊 Найдено {count} сообщений от пользователя {user_id}")
+        # Вторая кнопка в ряду (если есть)
+        if i + 1 < len(topic_items):
+            topic_key2, topic_data2 = topic_items[i + 1]
+            row.append(InlineKeyboardButton(
+                text=topic_data2["name"], 
+                callback_data=f"topic_{topic_key2}"
+            ))
         
-        logger.info(f"✅ Итого сообщений от пользователя {user_id}: {count}")
-        return count
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка при поиске сообщений для {user_id}: {e}")
-        return 0
+        buttons.append(row)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    return keyboard
 
-async def restrict_user(chat_id: int, user_id: int) -> bool:
-    """Ограничить пользователя"""
-    try:
-        await app.restrict_chat_member(chat_id, user_id, restricted)
-        logger.info(f"🚫 Ограничен пользователь {user_id}")
-        return True
-    except ChatAdminRequired:
-        logger.error(f"❌ Нет прав администратора в чате {chat_id}")
-        return False
-    except UserAdminInvalid:
-        logger.warning(f"⚠️ Нельзя ограничить администратора {user_id}")
-        return False
-    except FloodWait as e:
-        logger.warning(f"⏳ FloodWait: ждем {e.value} секунд")
-        await asyncio.sleep(e.value)
-        return await restrict_user(chat_id, user_id)
-    except Exception as e:
-        logger.error(f"❌ Ошибка при ограничении пользователя {user_id}: {e}")
-        return False
+def get_example_keyboard():
+    """Клавиатура с примером заполнения"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📖 Пример заполнения", url=EXAMPLE_URL)]
+    ])
+    return keyboard
 
-async def unrestrict_user(chat_id: int, user_id: int) -> bool:
-    """Разрешить пользователю писать"""
-    try:
-        await app.restrict_chat_member(chat_id, user_id, unrestricted)
-        logger.info(f"✅ Разрешено писать пользователю {user_id}")
-        return True
-    except ChatAdminRequired:
-        logger.error(f"❌ Нет прав администратора в чате {chat_id}")
-        return False
-    except FloodWait as e:
-        logger.warning(f"⏳ FloodWait: ждем {e.value} секунд")
-        await asyncio.sleep(e.value)
-        return await unrestrict_user(chat_id, user_id)
-    except Exception as e:
-        logger.error(f"❌ Ошибка при разрешении пользователю {user_id}: {e}")
-        return False
+def get_post_actions_keyboard(user_id: int, message_url: str):
+    """Клавиатура после публикации"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Создать", callback_data="create_new"),
+            InlineKeyboardButton(text="👁 Посмотреть", url=message_url)
+        ]
+    ])
+    return keyboard
 
-@app.on_message(filters.chat(TARGET_CHAT_ID) & ~filters.service)
-async def handle_new_message(client: Client, message: Message):
-    """Обработка новых сообщений в целевом чате"""
-    if not message.from_user:
+def get_contact_keyboard(user_id: int, username: str = None):
+    """Кнопка для связи с автором"""
+    if username:
+        url = f"https://t.me/{username}"
+    else:
+        url = f"tg://user?id={user_id}"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✉️ Написать", url=url)]
+    ])
+    return keyboard
+
+@dp.message(Command("start"))
+async def start_handler(message: Message, state: FSMContext):
+    """Обработка команды /start"""
+    user_id = message.from_user.id
+    
+    # Если пользователь уже стартовал - игнорируем
+    if user_id in started_users:
         return
     
-    user_id = message.from_user.id
-    chat_id = message.chat.id
+    # Добавляем в список стартовавших
+    started_users.add(user_id)
     
-    async with processing_lock:
-        try:
-            # Быстро считаем сообщения только этого пользователя
-            count = await count_user_messages_fast(chat_id, user_id)
-            
-            username = message.from_user.username or message.from_user.first_name or "Без имени"
-            logger.info(f"📝 {username} (ID: {user_id}) написал сообщение. Всего сообщений: {count}")
-            
-            # Если сообщений >= 4, ограничиваем (добавляем в исключения)
-            if count >= 4:
-                success = await restrict_user(chat_id, user_id)
-                if success:
-                    logger.info(f"🚫 Пользователь {user_id} добавлен в исключения ({count} сообщений)")
-                
-        except Exception as e:
-            logger.error(f"❌ Ошибка при обработке нового сообщения: {e}")
+    await message.answer(
+        "🌍 Выберите язык / Choose language:",
+        reply_markup=get_language_keyboard()
+    )
+    await state.set_state(AdStates.choosing_language)
 
-@app.on_deleted_messages()
-async def handle_deleted_messages(client: Client, messages):
-    """Мониторинг ТОЛЬКО удалений сообщений"""
-    async with processing_lock:
-        processed_users = set()
-        
-        for message in messages:
-            if not message.from_user or not message.chat:
-                continue
-                
-            user_id = message.from_user.id
-            chat_id = message.chat.id
-            
-            # Работаем только в целевом чате и только один раз на пользователя
-            if chat_id != TARGET_CHAT_ID or user_id in processed_users:
-                continue
-                
-            processed_users.add(user_id)
-            
-            try:
-                # Быстро пересчитываем сообщения конкретного пользователя
-                count = await count_user_messages_fast(chat_id, user_id)
-                
-                username = message.from_user.username or message.from_user.first_name or "Без имени"
-                logger.info(f"🗑️ Удалено сообщение {username} (ID: {user_id}). Осталось: {count}")
-                
-                # Если стало < 4, разрешаем писать (убираем из исключений)
-                if count < 4:
-                    success = await unrestrict_user(chat_id, user_id)
-                    if success:
-                        logger.info(f"✅ Пользователь {user_id} убран из исключений ({count} сообщений)")
-                    
-            except Exception as e:
-                logger.error(f"❌ Ошибка при обработке удаления для {user_id}: {e}")
+@dp.callback_query(F.data == "lang_ru", StateFilter(AdStates.choosing_language))
+async def language_ru_handler(callback: CallbackQuery, state: FSMContext):
+    """Выбор русского языка"""
+    await callback.message.edit_text(
+        "📝 В какую тему хотите написать?",
+        reply_markup=get_topics_keyboard()
+    )
+    await state.set_state(AdStates.choosing_topic)
+    await callback.answer()
 
-@app.on_message(filters.command("check") & filters.chat(TARGET_CHAT_ID) & filters.me)
-async def check_user_command(client: Client, message: Message):
-    """Команда для проверки количества сообщений пользователя"""
-    if message.reply_to_message and message.reply_to_message.from_user:
-        user = message.reply_to_message.from_user
-        count = await count_user_messages_fast(message.chat.id, user.id)
+@dp.callback_query(F.data == "lang_en", StateFilter(AdStates.choosing_language))
+async def language_en_handler(callback: CallbackQuery, state: FSMContext):
+    """Выбор английского языка (заглушка)"""
+    await callback.answer("🚧 English version coming soon!", show_alert=True)
+
+@dp.callback_query(F.data.startswith("topic_"), StateFilter(AdStates.choosing_topic))
+async def topic_handler(callback: CallbackQuery, state: FSMContext):
+    """Выбор темы"""
+    topic_key = callback.data.replace("topic_", "")
+    
+    if topic_key in TOPICS:
+        # Сохраняем выбранную тему
+        await state.update_data(selected_topic=topic_key)
         
-        status = "🚫 В исключениях" if count >= 4 else "✅ Может писать"
-        
-        await message.edit(
-            f"👤 **{user.first_name or 'Без имени'}** (@{user.username or 'нет'})\n"
-            f"🆔 ID: `{user.id}`\n"
-            f"📊 Сообщений: **{count}**\n"
-            f"🎯 Статус: {status}"
+        await callback.message.edit_text(
+            "✍️ Напишите объявление и отправьте:",
+            reply_markup=get_example_keyboard()
         )
+        await state.set_state(AdStates.writing_ad)
+    
+    await callback.answer()
+
+@dp.message(StateFilter(AdStates.writing_ad))
+async def ad_text_handler(message: Message, state: FSMContext):
+    """Обработка текста объявления"""
+    user_data_state = await state.get_data()
+    selected_topic = user_data_state.get("selected_topic")
+    
+    if not selected_topic or selected_topic not in TOPICS:
+        await message.answer("❌ Ошибка: тема не выбрана. Начните заново с /start")
+        await state.clear()
+        return
+    
+    # Получаем данные темы
+    topic_data = TOPICS[selected_topic]
+    topic_id = topic_data["id"]
+    
+    # Форматируем объявление
+    ad_text = message.text or message.caption or ""
+    if not ad_text:
+        await message.answer("❌ Объявление не может быть пустым!")
+        return
+    
+    # Разбиваем на строки
+    lines = ad_text.split('\n')
+    if lines:
+        # Первую строку в цитату
+        formatted_text = f"<blockquote>{lines[0]}</blockquote>"
+        # Остальные строки как есть
+        if len(lines) > 1:
+            formatted_text += "\n" + "\n".join(lines[1:])
     else:
-        await message.edit("❌ Ответьте на сообщение пользователя для проверки")
-
-@app.on_message(filters.command("stats") & filters.chat(TARGET_CHAT_ID) & filters.me)
-async def stats_command(client: Client, message: Message):
-    """Статистика работы бота"""
+        formatted_text = f"<blockquote>{ad_text}</blockquote>"
+    
     try:
-        chat = await app.get_chat(TARGET_CHAT_ID)
-        me = await app.get_me()
-        member = await app.get_chat_member(TARGET_CHAT_ID, me.id)
-        admin_status = "✅ Администратор" if member.status in ["administrator", "creator"] else "❌ Не администратор"
-        
-        await message.edit(
-            f"📊 **Статистика бота**\n\n"
-            f"🏠 Чат: {chat.title}\n"
-            f"👑 Статус: {admin_status}\n"
-            f"🎯 Лимит сообщений: 4\n"
-            f"⚡ Режим: Быстрый поиск по пользователям\n"
-            f"🔍 Мониторинг: Новые сообщения + Удаления"
+        # Публикуем в группу
+        sent_message = await bot.send_message(
+            chat_id=TARGET_CHAT_ID,
+            text=formatted_text,
+            message_thread_id=topic_id,
+            parse_mode="HTML",
+            reply_markup=get_contact_keyboard(
+                message.from_user.id, 
+                message.from_user.username
+            )
         )
+        
+        # Формируем ссылку на сообщение
+        message_url = f"https://t.me/c/{str(TARGET_CHAT_ID)[4:]}/{sent_message.message_id}"
+        
+        # Уведомляем автора
+        await message.answer(
+            "✅ Ваше объявление опубликовано!",
+            reply_markup=get_post_actions_keyboard(message.from_user.id, message_url)
+        )
+        
+        logger.info(f"Объявление опубликовано: пользователь {message.from_user.id}, тема {selected_topic}")
+        
     except Exception as e:
-        await message.edit(f"❌ Ошибка получения статистики: {e}")
+        logger.error(f"Ошибка публикации: {e}")
+        await message.answer("❌ Ошибка при публикации объявления. Попробуйте позже.")
+    
+    await state.clear()
+
+@dp.callback_query(F.data == "create_new")
+async def create_new_handler(callback: CallbackQuery, state: FSMContext):
+    """Создание нового объявления"""
+    await callback.message.edit_text(
+        "📝 В какую тему хотите написать?",
+        reply_markup=get_topics_keyboard()
+    )
+    await state.set_state(AdStates.choosing_topic)
+    await callback.answer()
+
+async def set_bot_commands():
+    """Установка команд бота"""
+    commands = [
+        BotCommand(command="start", description="🚀 Начать работу с ботом")
+    ]
+    await bot.set_my_commands(commands)
 
 async def main():
-    """Основная функция"""
-    logger.info("🚀 Запуск эффективного бота...")
+    """Главная функция"""
+    logger.info("🚀 Запуск бота объявлений...")
     
-    try:
-        async with app:
-            me = await app.get_me()
-            logger.info(f"✅ Авторизован как: {me.first_name} (@{me.username})")
-            
-            # Проверяем целевой чат
-            try:
-                chat = await app.get_chat(TARGET_CHAT_ID)
-                logger.info(f"🎯 Целевой чат: {chat.title} (ID: {TARGET_CHAT_ID})")
-                
-                # Проверяем права
-                member = await app.get_chat_member(TARGET_CHAT_ID, me.id)
-                if member.status in ["administrator", "creator"]:
-                    logger.info("✅ Права администратора подтверждены")
-                else:
-                    logger.warning("⚠️ Нет прав администратора!")
-                    
-            except Exception as e:
-                logger.error(f"❌ Ошибка при проверке чата: {e}")
-                return
-            
-            logger.info("🎯 Логика работы:")
-            logger.info("  📝 Новое сообщение → Быстрый поиск по автору → Если ≥4 то блок")
-            logger.info("  🗑️ Удаление → Быстрый поиск по автору → Если <4 то разблок")
-            logger.info("✅ Бот запущен и готов к работе!")
-            
-            await app.idle()
-            
-    except Exception as e:
-        logger.error(f"❌ Критическая ошибка: {e}")
-        raise
+    # Устанавливаем команды
+    await set_bot_commands()
+    
+    # Запускаем бота
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
