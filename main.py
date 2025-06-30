@@ -41,14 +41,14 @@ class Config:
     MODERATION_CHAT_ID = int(os.getenv("MODERATION_CHAT_ID", "0"))
     
     # Web настройки
-    WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "https://your-app.onrender.com")
+    WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "https://six-01tj.onrender.com")
     WEBHOOK_PATH = "/webhook"
     WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-    PORT = int(os.getenv("PORT", "8080"))
+    PORT = int(os.getenv("PORT", "10000"))
     
     # Бизнес настройки
-    GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/your_group")
-    EXAMPLE_URL = os.getenv("EXAMPLE_URL", "https://example.com")
+    GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/sfetg4/215")
+    EXAMPLE_URL = os.getenv("EXAMPLE_URL", "https://t.me/sfetg4/215")
     DEFAULT_AD_LIMIT = 4
     RATE_LIMIT_WINDOW = 60
     RATE_LIMIT_MAX_REQUESTS = 10
