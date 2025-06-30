@@ -326,11 +326,14 @@ async def send_edit_to_moderation(user_id: int, username: str, text: str, messag
     
     try:
         username_text = f"@{username}" if username else "Нет username"
+        message_id = message_url.split('/')[-1]
+        
         moderation_text = (
             f"✏️ Изменение объявления:\n\n"
             f"👤 ID: {user_id}\n"
             f"🔗 Username: {username_text}\n"
-            f"📂 Тема: {topic_name}\n\n"
+            f"📂 Тема: {topic_name}\n"
+            f"🆔 ID сообщения: {message_id}\n\n"
             f"📝 Новый текст:\n{text}\n\n"
             f"🔗 Ссылка: {message_url}"
         )
@@ -457,10 +460,10 @@ def get_back_to_main_keyboard():
     ])
     return keyboard
 
-def get_edit_back_keyboard(message_id: int):
+def get_edit_back_keyboard(message_id: int, message_url: str):
     """Клавиатура для возврата при редактировании"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👁 Посмотреть", callback_data=f"view_ad_{message_id}")],
+        [InlineKeyboardButton(text="👁 Посмотреть", url=message_url)],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"view_ad_{message_id}")]
     ])
     return keyboard
@@ -1121,7 +1124,7 @@ async def edit_ad_text_handler(message: Message, state: FSMContext):
         
         await message.answer(
             "✅ Объявление изменено!",
-            reply_markup=get_after_edit_keyboard(message_url)
+            reply_markup=get_back_to_main_keyboard()
         )
         logger.info(f"Объявление отредактировано: пользователь {message.from_user.id}, сообщение {editing_message_id}")
     else:
@@ -1187,7 +1190,7 @@ async def edit_ad_handler(callback: CallbackQuery, state: FSMContext):
     # Отправляем инструкцию для редактирования
     await callback.message.edit_text(
         "✏️ Скопируйте свое сообщение из группы и измените, после отправьте повторно:",
-        reply_markup=get_edit_back_keyboard(message_id)
+        reply_markup=get_edit_back_keyboard(message_id, message_url)
     )
     
     await state.set_state(AdStates.editing_ad)
