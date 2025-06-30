@@ -394,6 +394,16 @@ def validate_message_text(text: str) -> tuple[bool, str]:
     if 'https://' in text.lower() or 'http://' in text.lower():
         return False, "❌ https:// не принимаются, мы сами вставим ссылку на вас."
     
+    # Проверяем на #
+    if '#' in text:
+        return False, "❌ # не принимается, мы сами вставим ссылку на вас."
+    
+    # Проверяем на сайты (домены)
+    import re
+    domain_pattern = r'\b[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.([a-zA-Z]{2,})\b'
+    if re.search(domain_pattern, text):
+        return False, "❌ Сайты не принимаются, мы сами вставим ссылку на вас."
+    
     return True, ""
 
 async def send_to_moderation(user_id: int, username: str, text: str, message_url: str, topic_name: str):
