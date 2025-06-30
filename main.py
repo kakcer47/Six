@@ -98,18 +98,9 @@ async def init_db():
                     message_id BIGINT NOT NULL,
                     message_url TEXT NOT NULL,
                     topic_name TEXT NOT NULL,
-                    original_text TEXT NOT NULL DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # Добавляем колонку original_text если её нет
-            try:
-                await connection.execute("""
-                    ALTER TABLE user_ads ADD COLUMN IF NOT EXISTS original_text TEXT NOT NULL DEFAULT ''
-                """)
-            except:
-                pass
             
             # Таблица забаненных пользователей
             await connection.execute("""
@@ -140,19 +131,19 @@ async def init_db():
         logger.error(f"❌ Ошибка инициализации БД: {e}")
         raise
 
-async def add_user_ad(user_id: int, message_id: int, message_url: str, topic_name: str, original_text: str = ""):
+async def add_user_ad(user_id: int, message_id: int, message_url: str, topic_name: str):
     """Добавить объявление пользователя в БД"""
     try:
         async with db_pool.acquire() as connection:
             await connection.execute(
-                "INSERT INTO user_ads (user_id, message_id, message_url, topic_name, original_text) VALUES ($1, $2, $3, $4, $5)",
-                user_id, message_id, message_url, topic_name, original_text
+                "INSERT INTO user_ads (user_id, message_id, message_url, topic_name) VALUES ($1, $2, $3, $4)",
+                user_id, message_id, message_url, topic_name
             )
     except Exception as e:
         logger.error(f"Ошибка добавления объявления: {e}")
 
 async def get_user_ads(user_id: int):
-    """Получить объявления пользователя"""
+    """Получить объявления пользователя (совместимость)"""
     try:
         async with db_pool.acquire() as connection:
             rows = await connection.fetch(
@@ -164,20 +155,55 @@ async def get_user_ads(user_id: int):
         logger.error(f"Ошибка получения объявлений: {e}")
         return []
 
+async def get_user_ads_with_counts(user_id: int):
+    """Получить объявления пользователя с подсчетом по темам"""
+    try:
+        async with db_pool.acquire() as connection:
+            rows = await connection.fetch(
+                "SELECT message_id, message_url, topic_name, created_at FROM user_ads WHERE user_id = $1 ORDER BY created_at DESC",
+                user_id
+            )
+            
+            # Группируем по темам и считаем номера
+            topic_counts = {}
+            result = []
+            
+            for row in rows:
+                topic = row['topic_name']
+                if topic not in topic_counts:
+                    topic_counts[topic] = 0
+                topic_counts[topic] += 1
+                
+                # Формируем название с номером
+                topic_display = f"{topic} {topic_counts[topic]}"
+                result.append((row['message_id'], row['message_url'], topic_display, row['topic_name']))
+            
+            return result
+    except Exception as e:
+        logger.error(f"Ошибка получения объявлений: {e}")
+        return []
+
 async def get_ad_by_message_id(message_id: int):
     """Получить объявление по message_id"""
     try:
         async with db_pool.acquire() as connection:
             row = await connection.fetchrow(
-                "SELECT user_id, message_id, message_url, topic_name, original_text FROM user_ads WHERE message_id = $1",
+                "SELECT user_id, message_id, message_url, topic_name FROM user_ads WHERE message_id = $1",
                 message_id
             )
             if row:
-                return (row['user_id'], row['message_id'], row['message_url'], row['topic_name'], row['original_text'])
+                return (row['user_id'], row['message_id'], row['message_url'], row['topic_name'])
             return None
     except Exception as e:
         logger.error(f"Ошибка получения объявления: {e}")
         return None
+
+async def notify_user(user_id: int, message: str):
+    """Отправить уведомление пользователю"""
+    try:
+        await bot.send_message(chat_id=user_id, text=message)
+    except Exception as e:
+        logger.error(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
 
 async def delete_user_ad(message_id: int):
     """Удалить объявление из БД"""
@@ -293,16 +319,28 @@ async def set_user_limit(user_id: int, limit: int):
     except Exception as e:
         logger.error(f"Ошибка установки лимита: {e}")
 
-async def get_original_message_text(message_id: int) -> str:
-    """Получить оригинальный текст сообщения из БД"""
+async def send_edit_to_moderation(user_id: int, username: str, text: str, message_url: str, topic_name: str):
+    """Отправить уведомление об изменении в группу модерации"""
+    if not MODERATION_CHAT_ID or MODERATION_CHAT_ID == 0:
+        return
+    
     try:
-        ad_data = await get_ad_by_message_id(message_id)
-        if ad_data and len(ad_data) > 4:
-            return ad_data[4]  # original_text
-        return ""
+        username_text = f"@{username}" if username else "Нет username"
+        moderation_text = (
+            f"✏️ Изменение объявления:\n\n"
+            f"👤 ID: {user_id}\n"
+            f"🔗 Username: {username_text}\n"
+            f"📂 Тема: {topic_name}\n\n"
+            f"📝 Новый текст:\n{text}\n\n"
+            f"🔗 Ссылка: {message_url}"
+        )
+        
+        await bot.send_message(
+            chat_id=MODERATION_CHAT_ID,
+            text=moderation_text
+        )
     except Exception as e:
-        logger.error(f"Ошибка получения текста сообщения: {e}")
-        return ""
+        logger.error(f"Ошибка отправки изменения в модерацию: {e}")
 
 async def edit_message_in_group(message_id: int, new_text: str, user_id: int, username: str = None) -> bool:
     """Редактировать сообщение в группе"""
@@ -419,14 +457,15 @@ def get_back_to_main_keyboard():
     ])
     return keyboard
 
-def get_edit_back_keyboard():
+def get_edit_back_keyboard(message_id: int):
     """Клавиатура для возврата при редактировании"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_my_ads")]
+        [InlineKeyboardButton(text="👁 Посмотреть", callback_data=f"view_ad_{message_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"view_ad_{message_id}")]
     ])
     return keyboard
 
-def get_after_edit_keyboard(message_url: str):
+async def get_after_edit_keyboard(message_url: str):
     """Клавиатура после редактирования объявления"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -488,27 +527,6 @@ def get_post_actions_keyboard(user_id: int, message_url: str):
     ])
     return keyboard
 
-async def get_my_ads_keyboard(user_id: int):
-    """Клавиатура с объявлениями пользователя"""
-    ads = await get_user_ads(user_id)
-    buttons = []
-    
-    for i, (message_id, message_url, topic_name) in enumerate(ads, 1):
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"📄 Объявление {i}", 
-                callback_data=f"view_ad_{message_id}"
-            )
-        ])
-    
-    # Кнопка назад
-    buttons.append([
-        InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")
-    ])
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    return keyboard
-
 @dp.message(Command("start"))
 async def start_handler(message: Message, state: FSMContext):
     """Обработка команды /start"""
@@ -547,6 +565,7 @@ async def ban_command(message: Message):
         
         user_id = int(args[1])
         await ban_user(user_id)
+        await notify_user(user_id, "🚫 Вы были заблокированы администрацией.")
         await message.answer(f"✅ Пользователь {user_id} забанен")
         
     except ValueError:
@@ -578,6 +597,9 @@ async def banall_command(message: Message):
         
         # Банем пользователя
         await ban_user(user_id)
+        
+        # Уведомляем пользователя
+        await notify_user(user_id, f"🚫 Вы были заблокированы администрацией. Все ваши объявления ({deleted_count} шт.) удалены.")
         
         await message.answer(
             f"✅ Пользователь {user_id} забанен\n"
@@ -615,6 +637,7 @@ async def banoff_command(message: Message):
         
         # Разбаниваем пользователя
         await unban_user(user_id)
+        await notify_user(user_id, "✅ Ваша блокировка снята. Теперь вы можете снова размещать объявления.")
         
         await message.answer(f"✅ Пользователь {user_id} разбанен")
         
@@ -651,11 +674,72 @@ async def setlimit_command(message: Message):
             await message.answer("❌ Максимальный лимит: 50 объявлений")
             return
         
+        old_limit = await get_user_limit(user_id)
         await set_user_limit(user_id, limit)
+        
+        # Уведомляем пользователя
+        if limit > old_limit:
+            await notify_user(user_id, f"📈 Ваш лимит объявлений увеличен с {old_limit} до {limit}.")
+        elif limit < old_limit:
+            await notify_user(user_id, f"📉 Ваш лимит объявлений уменьшен с {old_limit} до {limit}.")
+        
         await message.answer(f"✅ Лимит для пользователя {user_id} установлен: {limit} объявлений")
         
     except ValueError:
         await message.answer("❌ Неверные параметры. Используйте числа.")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(Command("deladmin"))
+async def deladmin_command(message: Message):
+    """Команда удаления объявления администратором"""
+    # Блокируем команды из группы объявлений
+    if message.chat.id == TARGET_CHAT_ID:
+        return
+    
+    # Работает только в группе модерации
+    if not MODERATION_CHAT_ID or message.chat.id != MODERATION_CHAT_ID:
+        return
+    
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await message.answer("❌ Использование: /deladmin <message_id>")
+            return
+        
+        message_id = int(args[1])
+        ad_data = await get_ad_by_message_id(message_id)
+        
+        if not ad_data:
+            await message.answer("❌ Объявление не найдено в базе данных")
+            return
+        
+        user_id, msg_id, message_url, topic_name = ad_data
+        
+        # Получаем информацию о пользователе для красивого названия
+        ads = await get_user_ads_with_counts(user_id)
+        ad_display_name = "объявление"
+        for ad_msg_id, _, topic_display, _ in ads:
+            if ad_msg_id == message_id:
+                ad_display_name = f'"{topic_display}"'
+                break
+        
+        try:
+            # Удаляем сообщение из чата
+            await bot.delete_message(chat_id=TARGET_CHAT_ID, message_id=message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение {message_id} из чата: {e}")
+        
+        # Удаляем из БД
+        await delete_user_ad(message_id)
+        
+        # Уведомляем пользователя
+        await notify_user(user_id, f"🗑 Ваше объявление {ad_display_name} было удалено площадкой из-за нарушения правил.")
+        
+        await message.answer(f"✅ Объявление {message_id} удалено. Пользователь {user_id} уведомлен.")
+        
+    except ValueError:
+        await message.answer("❌ Неверный ID сообщения")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
@@ -925,8 +1009,7 @@ async def ad_text_handler(message: Message, state: FSMContext):
             message.from_user.id, 
             sent_message.message_id, 
             message_url, 
-            topic_name,
-            ad_text  # Сохраняем оригинальный текст
+            topic_name
         )
         
         # Отправляем в группу модерации
@@ -981,6 +1064,7 @@ async def edit_ad_text_handler(message: Message, state: FSMContext):
     user_data = await state.get_data()
     editing_message_id = user_data.get("editing_message_id")
     message_url = user_data.get("message_url")
+    topic_name = user_data.get("topic_name")
     
     if not editing_message_id:
         await message.answer("❌ Ошибка: объявление для редактирования не найдено.")
@@ -1005,6 +1089,15 @@ async def edit_ad_text_handler(message: Message, state: FSMContext):
     )
     
     if success:
+        # Отправляем уведомление в модерацию
+        await send_edit_to_moderation(
+            message.from_user.id,
+            message.from_user.username,
+            new_text,
+            message_url,
+            topic_name
+        )
+        
         await message.answer(
             "✅ Объявление изменено!",
             reply_markup=get_after_edit_keyboard(message_url)
@@ -1018,31 +1111,6 @@ async def edit_ad_text_handler(message: Message, state: FSMContext):
     
     await state.clear()
 
-# Блокировка любых сообщений в группе объявлений
-@dp.message()
-async def block_target_chat_messages(message: Message):
-    """Блокировка сообщений в группе объявлений"""
-    if message.chat.id == TARGET_CHAT_ID:
-        return
-    
-    # Если сообщение не из группы объявлений, пропускаем
-    pass
-
-@dp.callback_query(F.data == "create_new")
-async def create_new_handler(callback: CallbackQuery, state: FSMContext):
-    """Создание нового объявления"""
-    # Проверяем бан
-    if await is_user_banned(callback.from_user.id):
-        await callback.answer("🚫 Вы заблокированы в этом боте.", show_alert=True)
-        return
-    
-    await callback.message.edit_text(
-        "📝 В какую тему хотите написать?",
-        reply_markup=get_topics_keyboard()
-    )
-    await state.set_state(AdStates.choosing_topic)
-    await callback.answer()
-
 @dp.callback_query(F.data.startswith("view_ad_"))
 async def view_ad_handler(callback: CallbackQuery, state: FSMContext):
     """Просмотр действий с объявлением"""
@@ -1053,7 +1121,7 @@ async def view_ad_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Объявление не найдено", show_alert=True)
         return
     
-    user_id, message_id, message_url, topic_name, _ = ad_data  # Игнорируем original_text
+    user_id, message_id, message_url, topic_name = ad_data
     
     # Проверяем, что объявление принадлежит пользователю
     if user_id != callback.from_user.id:
@@ -1081,32 +1149,52 @@ async def edit_ad_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Объявление не найдено", show_alert=True)
         return
     
-    user_id, message_id, message_url, topic_name, original_text = ad_data
+    user_id, message_id, message_url, topic_name = ad_data
     
     # Проверяем, что объявление принадлежит пользователю
     if user_id != callback.from_user.id:
         await callback.answer("❌ Это не ваше объявление", show_alert=True)
         return
     
-    # Получаем оригинальный текст
-    if not original_text:
-        original_text = "Введите новый текст объявления"
-    
     # Сохраняем данные для редактирования
     await state.update_data(
         editing_message_id=message_id,
-        message_url=message_url
+        message_url=message_url,
+        topic_name=topic_name
     )
     
-    # Отправляем текст для редактирования
+    # Отправляем инструкцию для редактирования
     await callback.message.edit_text(
-        f"✏️ Скопируйте свое сообщение и измените, после отправьте повторно:\n\n"
-        f"<code>{original_text}</code>",
-        reply_markup=get_edit_back_keyboard(),
-        parse_mode="HTML"
+        "✏️ Скопируйте свое сообщение из группы и измените, после отправьте повторно:",
+        reply_markup=get_edit_back_keyboard(message_id)
     )
     
     await state.set_state(AdStates.editing_ad)
+    await callback.answer()
+
+# Блокировка любых сообщений в группе объявлений
+@dp.message()
+async def block_target_chat_messages(message: Message):
+    """Блокировка сообщений в группе объявлений"""
+    if message.chat.id == TARGET_CHAT_ID:
+        return
+    
+    # Если сообщение не из группы объявлений, пропускаем
+    pass
+
+@dp.callback_query(F.data == "create_new")
+async def create_new_handler(callback: CallbackQuery, state: FSMContext):
+    """Создание нового объявления"""
+    # Проверяем бан
+    if await is_user_banned(callback.from_user.id):
+        await callback.answer("🚫 Вы заблокированы в этом боте.", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "📝 В какую тему хотите написать?",
+        reply_markup=get_topics_keyboard()
+    )
+    await state.set_state(AdStates.choosing_topic)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("delete_ad_"))
@@ -1143,7 +1231,7 @@ async def cancel_delete_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Объявление не найдено", show_alert=True)
         return
     
-    user_id, message_id, message_url, topic_name, _ = ad_data  # Игнорируем original_text
+    user_id, message_id, message_url, topic_name = ad_data
     
     # Возвращаемся к просмотру объявления
     await callback.message.edit_text(
@@ -1168,7 +1256,7 @@ async def confirm_delete_handler(callback: CallbackQuery, state: FSMContext):
             await callback.answer("❌ Объявление не найдено", show_alert=True)
             return
         
-        user_id, message_id, message_url, topic_name, _ = ad_data  # Игнорируем original_text
+        user_id, message_id, message_url, topic_name = ad_data
         
         # Проверяем, что объявление принадлежит пользователю
         if user_id != callback.from_user.id:
@@ -1185,7 +1273,7 @@ async def confirm_delete_handler(callback: CallbackQuery, state: FSMContext):
         await delete_user_ad(message_id)
         
         # Возвращаемся к списку объявлений
-        ads = await get_user_ads(callback.from_user.id)
+        ads = await get_user_ads_with_counts(callback.from_user.id)
         user_limit = await get_user_limit(callback.from_user.id)
         
         if not ads:
