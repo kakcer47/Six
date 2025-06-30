@@ -1,0 +1,145 @@
+# ===========================================
+# Render.com Blueprint для автоматического деплоя
+# Создает все необходимые сервисы одной командой
+# ===========================================
+
+services:
+  # ==================== ОСНОВНОЕ ПРИЛОЖЕНИЕ ====================
+  - type: web
+    name: telegram-bot-web
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    buildCommand: ""
+    startCommand: "python main.py"
+    healthCheckPath: /health
+    
+    # Переменные окружения
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      
+      - key: BOT_TOKEN
+        sync: false  # Устанавливается вручную через UI
+        
+      - key: TARGET_CHAT_ID
+        sync: false  # Устанавливается вручную
+        
+      - key: MODERATION_CHAT_ID
+        sync: false  # Опционально
+        
+      - key: GROUP_LINK
+        value: https://t.me/your_group
+        
+      - key: EXAMPLE_URL
+        value: https://example.com
+        
+      - key: WEBHOOK_HOST
+        fromService:
+          type: web
+          name: telegram-bot-web
+          property: host
+          
+      - key: PORT
+        value: "8080"
+        
+      - key: DATABASE_URL
+        fromDatabase:
+          name: telegram-bot-db
+          property: connectionString
+          
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: telegram-bot-redis
+          property: connectionString
+    
+    # Автодеплой из GitHub
+    autoDeploy: true
+    
+    # Кастомные домены (опционально)
+    # customDomains:
+    #   - name: bot.yourdomain.com
+    
+    # ==================== БАЗЫ ДАННЫХ ====================
+  - type: pserv
+    name: telegram-bot-db
+    env: docker
+    dockerfilePath: ./Dockerfile.postgres  # Создается автоматически
+    plan: free
+    region: oregon
+    
+    # Переменные для PostgreSQL
+    envVars:
+      - key: POSTGRES_DB
+        value: telegram_bot
+        
+      - key: POSTGRES_USER
+        generateValue: true  # Автогенерация
+        
+      - key: POSTGRES_PASSWORD
+        generateValue: true  # Автогенерация
+    
+    # Persistent диск для данных
+    disk:
+      name: postgres-data
+      mountPath: /var/lib/postgresql/data
+      sizeGB: 1  # Бесплатный план
+    
+    # Инициализация БД
+    buildCommand: |
+      echo "Preparing PostgreSQL..."
+      # Скрипт инициализации выполнится автоматически
+    
+    # ==================== REDIS КЭШИРОВАНИЕ ====================
+  - type: redis
+    name: telegram-bot-redis
+    plan: free
+    region: oregon
+    maxmemoryPolicy: allkeys-lru
+    
+    # Конфигурация Redis
+    ipAllowList: []  # Доступ только для сервисов в том же аккаунте
+    
+# ==================== СТАТИЧЕСКИЕ ФАЙЛЫ ====================
+# Если нужны статические файлы (документация и т.д.)
+# - type: static
+#   name: bot-docs
+#   buildCommand: "echo 'Building docs...'"
+#   publishPath: ./docs
+#   pullRequestPreviewsEnabled: false
+
+# ==================== CRON ЗАДАЧИ ====================
+# Периодические задачи (очистка, статистика)
+- type: cron
+  name: daily-cleanup
+  schedule: "0 2 * * *"  # Каждый день в 2:00 UTC
+  dockerfilePath: ./Dockerfile.tasks
+  buildCommand: "echo 'Building cron tasks...'"
+  startCommand: "python -c 'import asyncio; from monitoring import cli_admin; asyncio.run(cli_admin(\"cleanup\"))'"
+  
+  envVars:
+    - key: DATABASE_URL
+      fromDatabase:
+        name: telegram-bot-db
+        property: connectionString
+        
+    - key: REDIS_URL
+      fromService:
+        type: redis
+        name: telegram-bot-redis
+        property: connectionString
+
+- type: cron
+  name: update-stats
+  schedule: "0 */6 * * *"  # Каждые 6 часов
+  dockerfilePath: ./Dockerfile.tasks
+  buildCommand: "echo 'Building stats update...'"
+  startCommand: "python -c 'import asyncio; from monitoring import cli_admin; asyncio.run(cli_admin(\"update-stats\"))'"
+  
+  envVars:
+    - key: DATABASE_URL
+      fromDatabase:
+        name: telegram-bot-db
+        property: connectionString
