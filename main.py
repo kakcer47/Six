@@ -1,20 +1,19 @@
 """
-Продакшн-готовый Telegram бот для объявлений
-Архитектура: webhook + aiohttp + PostgreSQL + Redis cache
-Оптимизирован для Render.com deployment
+Упрощенный продакшн Telegram бот для объявлений
+Архитектура: webhook + aiohttp + PostgreSQL + Memory cache
+Оптимизирован для Render.com без Redis и мониторинга
 """
 
 import asyncio
 import logging
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from contextlib import asynccontextmanager
 import asyncpg
-import redis.asyncio as redis
 from aiohttp import web, ClientSession
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, 
     InlineKeyboardButton, BotCommand, Update
@@ -22,9 +21,9 @@ from aiogram.types import (
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 import re
 from functools import wraps
 from collections import defaultdict
@@ -36,7 +35,6 @@ class Config:
     """Централизованная конфигурация"""
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     DATABASE_URL = os.getenv("DATABASE_URL")
-    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
     
     # Telegram настройки
     TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002827106973"))
@@ -46,18 +44,18 @@ class Config:
     WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "https://your-app.onrender.com")
     WEBHOOK_PATH = "/webhook"
     WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-    PORT = int(os.getenv("PORT", 8080))
+    PORT = int(os.getenv("PORT", "8080"))
     
     # Бизнес настройки
     GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/your_group")
     EXAMPLE_URL = os.getenv("EXAMPLE_URL", "https://example.com")
     DEFAULT_AD_LIMIT = 4
-    RATE_LIMIT_WINDOW = 60  # секунд
+    RATE_LIMIT_WINDOW = 60
     RATE_LIMIT_MAX_REQUESTS = 10
     
     # Database pool настройки
     DB_MIN_SIZE = 2
-    DB_MAX_SIZE = 10
+    DB_MAX_SIZE = 8
     DB_COMMAND_TIMEOUT = 30
     
     @classmethod
@@ -115,11 +113,11 @@ TOPICS: Dict[str, TopicInfo] = {
 bot: Bot = None
 dp: Dispatcher = None
 db_pool: asyncpg.Pool = None
-redis_client: redis.Redis = None
 app: web.Application = None
 
-# Rate limiting
+# Rate limiting и кэширование в памяти
 rate_limiter = defaultdict(list)
+memory_cache = {}
 
 # ==================== ЛОГИРОВАНИЕ ====================
 
@@ -128,9 +126,7 @@ def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-        ]
+        handlers=[logging.StreamHandler()]
     )
     # Отключаем verbose логи
     logging.getLogger('aiogram').setLevel(logging.WARNING)
@@ -178,40 +174,36 @@ def ban_check(func):
         return await func(event, *args, **kwargs)
     return wrapper
 
-# ==================== КЭШИРОВАНИЕ ====================
+# ==================== КЭШИРОВАНИЕ В ПАМЯТИ ====================
 
 class CacheService:
-    """Сервис кэширования"""
+    """Сервис кэширования в памяти"""
     
     @staticmethod
     async def get(key: str) -> Optional[Any]:
         """Получить значение из кэша"""
-        try:
-            value = await redis_client.get(key)
-            return json.loads(value) if value else None
-        except Exception as e:
-            logger.warning(f"Cache get error: {e}")
-            return None
+        cache_data = memory_cache.get(key)
+        if cache_data:
+            value, expire_time = cache_data
+            if time.time() < expire_time:
+                return value
+            else:
+                # Удаляем просроченный кэш
+                memory_cache.pop(key, None)
+        return None
     
     @staticmethod
     async def set(key: str, value: Any, ttl: int = 300) -> bool:
         """Установить значение в кэш"""
-        try:
-            await redis_client.setex(key, ttl, json.dumps(value, default=str))
-            return True
-        except Exception as e:
-            logger.warning(f"Cache set error: {e}")
-            return False
+        expire_time = time.time() + ttl
+        memory_cache[key] = (value, expire_time)
+        return True
     
     @staticmethod
     async def delete(key: str) -> bool:
         """Удалить значение из кэша"""
-        try:
-            await redis_client.delete(key)
-            return True
-        except Exception as e:
-            logger.warning(f"Cache delete error: {e}")
-            return False
+        memory_cache.pop(key, None)
+        return True
 
 # ==================== БАЗА ДАННЫХ ====================
 
@@ -244,7 +236,7 @@ class DatabaseService:
             )
             
             async with get_db_connection() as conn:
-                # Создание таблиц с оптимизированными индексами
+                # Создание основных таблиц
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS user_ads (
                         id SERIAL PRIMARY KEY,
@@ -271,12 +263,11 @@ class DatabaseService:
                     )
                 """)
                 
-                # Создание оптимизированных индексов
+                # Создание индексов
                 indexes = [
-                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_user_ads_user_id ON user_ads(user_id)",
-                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_user_ads_message_id ON user_ads(message_id)",
-                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_user_ads_created_at ON user_ads(created_at DESC)",
-                    "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_user_ads_topic ON user_ads(topic_name)",
+                    "CREATE INDEX IF NOT EXISTS idx_user_ads_user_id ON user_ads(user_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_user_ads_message_id ON user_ads(message_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_user_ads_created_at ON user_ads(created_at DESC)",
                 ]
                 
                 for index_sql in indexes:
@@ -522,6 +513,22 @@ async def get_user_limit(user_id: int) -> int:
         logger.error(f"Ошибка получения лимита: {e}")
         return Config.DEFAULT_AD_LIMIT
 
+async def set_user_limit(user_id: int, limit: int):
+    """Установить лимит объявлений для пользователя"""
+    try:
+        async with get_db_connection() as conn:
+            await conn.execute(
+                """INSERT INTO user_limits (user_id, ad_limit) 
+                   VALUES ($1, $2) 
+                   ON CONFLICT (user_id) 
+                   DO UPDATE SET ad_limit = $2, updated_at = CURRENT_TIMESTAMP""",
+                user_id, limit
+            )
+            # Инвалидируем кэш
+            await CacheService.delete(f"user_limit:{user_id}")
+    except Exception as e:
+        logger.error(f"Ошибка установки лимита: {e}")
+
 async def notify_user(user_id: int, message: str) -> bool:
     """Уведомить пользователя"""
     try:
@@ -530,26 +537,6 @@ async def notify_user(user_id: int, message: str) -> bool:
     except Exception as e:
         logger.error(f"Ошибка уведомления пользователя {user_id}: {e}")
         return False
-
-async def send_to_moderation(user_id: int, username: str, text: str, message_url: str, topic_name: str):
-    """Отправить в модерацию"""
-    if not Config.MODERATION_CHAT_ID or Config.MODERATION_CHAT_ID == 0:
-        return
-    
-    try:
-        username_text = f"@{username}" if username else "Нет username"
-        moderation_text = (
-            f"📋 Новое объявление:\n\n"
-            f"👤 ID: {user_id}\n"
-            f"🔗 Username: {username_text}\n"
-            f"📂 Тема: {topic_name}\n\n"
-            f"📝 Текст:\n{text}\n\n"
-            f"🔗 Ссылка: {message_url}"
-        )
-        
-        await bot.send_message(chat_id=Config.MODERATION_CHAT_ID, text=moderation_text)
-    except Exception as e:
-        logger.error(f"Ошибка отправки в модерацию: {e}")
 
 # ==================== КЛАВИАТУРЫ ====================
 
@@ -603,6 +590,26 @@ class KeyboardService:
         ])
         
         return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+async def get_my_ads_keyboard(user_id: int):
+    """Клавиатура с объявлениями пользователя"""
+    ads = await DatabaseService.get_user_ads_with_counts(user_id)
+    buttons = []
+    
+    for message_id, message_url, topic_display, _ in ads:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"📄 {topic_display}", 
+                callback_data=f"view_ad_{message_id}"
+            )
+        ])
+    
+    # Кнопка назад
+    buttons.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")
+    ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ==================== ОБРАБОТЧИКИ ====================
 
@@ -771,7 +778,6 @@ async def ad_text_handler(message: Message, state: FSMContext):
         )
         
         await DatabaseService.add_user_ad(user_ad)
-        await send_to_moderation(user_id, message.from_user.username, ad_text, message_url, topic_data.name)
         
         new_count = await DatabaseService.get_user_ad_count(user_id)
         
@@ -808,74 +814,6 @@ async def ad_text_handler(message: Message, state: FSMContext):
             error_msg = "❌ Ошибка при публикации. Попробуйте позже."
         
         await message.answer(error_msg, reply_markup=keyboard)
-    
-    await state.clear()
-
-@dp.message(StateFilter(AdStates.editing_ad))
-@rate_limit()
-@ban_check
-async def edit_ad_text_handler(message: Message, state: FSMContext):
-    """Обработка редактирования объявления"""
-    if message.chat.id == Config.TARGET_CHAT_ID:
-        return
-    
-    user_data = await state.get_data()
-    editing_message_id = user_data.get("editing_message_id")
-    message_url = user_data.get("message_url")
-    topic_name = user_data.get("topic_name")
-    
-    if not editing_message_id:
-        await message.answer("❌ Ошибка: объявление для редактирования не найдено.")
-        await state.clear()
-        return
-    
-    new_text = message.text or message.caption or ""
-    
-    # Валидация
-    validation = ValidationService.validate_message_text(new_text)
-    if not validation.is_valid:
-        await message.answer(validation.error_message)
-        return
-    
-    # Редактируем сообщение в группе
-    success = await edit_message_in_group(
-        editing_message_id, 
-        new_text, 
-        message.from_user.id,
-        message.from_user.username
-    )
-    
-    if success:
-        # Отправляем уведомление в модерацию
-        await send_edit_to_moderation(
-            message.from_user.id,
-            message.from_user.username,
-            new_text,
-            message_url,
-            topic_name
-        )
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📋 Мои объявления", callback_data="my_ads"),
-                InlineKeyboardButton(text="👁 Посмотреть", url=message_url)
-            ],
-            [InlineKeyboardButton(text="🏠 На главную", callback_data="back_to_main")]
-        ])
-        
-        await message.answer(
-            "✅ Объявление изменено!",
-            reply_markup=keyboard
-        )
-        logger.info(f"Объявление отредактировано: пользователь {message.from_user.id}, сообщение {editing_message_id}")
-    else:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🏠 На главную", callback_data="back_to_main")]
-        ])
-        await message.answer(
-            "❌ Ошибка при редактировании объявления. Попробуйте позже.",
-            reply_markup=keyboard
-        )
     
     await state.clear()
 
@@ -919,32 +857,6 @@ async def back_to_topics_handler(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdStates.choosing_topic)
     await callback.answer()
 
-@dp.callback_query(F.data == "back_to_my_ads")
-async def back_to_my_ads_handler(callback: CallbackQuery, state: FSMContext):
-    """Возврат к моим объявлениям"""
-    try:
-        user_id = callback.from_user.id
-        ads = await DatabaseService.get_user_ads(user_id)
-        user_limit = await get_user_limit(user_id)
-        
-        if not ads:
-            await callback.message.edit_text(
-                "🏠 Главное меню:",
-                reply_markup=KeyboardService.get_main_menu_keyboard()
-            )
-            await state.set_state(AdStates.main_menu)
-        else:
-            keyboard = await get_my_ads_keyboard(user_id)
-            await callback.message.edit_text(
-                f"📋 Ваши объявления ({len(ads)}/{user_limit}):",
-                reply_markup=keyboard
-            )
-            await state.set_state(AdStates.my_ads)
-        await callback.answer()
-    except Exception as e:
-        logger.warning(f"Ошибка при возврате к объявлениям: {e}")
-        await callback.answer()
-
 # ==================== УПРАВЛЕНИЕ ОБЪЯВЛЕНИЯМИ ====================
 
 @dp.callback_query(F.data.startswith("view_ad_"))
@@ -967,7 +879,6 @@ async def view_ad_handler(callback: CallbackQuery, state: FSMContext):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_ad_{message_id}"),
-            InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit_ad_{message_id}")
         ],
         [InlineKeyboardButton(text="👁 Посмотреть", url=message_url)],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_my_ads")]
@@ -977,45 +888,6 @@ async def view_ad_handler(callback: CallbackQuery, state: FSMContext):
         f"📄 Объявление в теме: {topic_name}\n\nВыберите действие:",
         reply_markup=keyboard
     )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("edit_ad_"))
-@rate_limit()
-@ban_check
-async def edit_ad_handler(callback: CallbackQuery, state: FSMContext):
-    """Обработка редактирования объявления"""
-    message_id = int(callback.data.split("_")[-1])
-    ad_data = await DatabaseService.get_ad_by_message_id(message_id)
-    
-    if not ad_data:
-        await callback.answer("❌ Объявление не найдено", show_alert=True)
-        return
-    
-    user_id, message_id, message_url, topic_name = ad_data
-    
-    # Проверяем принадлежность
-    if user_id != callback.from_user.id:
-        await callback.answer("❌ Это не ваше объявление", show_alert=True)
-        return
-    
-    # Сохраняем данные для редактирования
-    await state.update_data(
-        editing_message_id=message_id,
-        message_url=message_url,
-        topic_name=topic_name
-    )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👁 Посмотреть", url=message_url)],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"view_ad_{message_id}")]
-    ])
-    
-    await callback.message.edit_text(
-        "✏️ Скопируйте свое сообщение из группы, измените и отправьте повторно:",
-        reply_markup=keyboard
-    )
-    
-    await state.set_state(AdStates.editing_ad)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("delete_ad_"))
@@ -1051,7 +923,6 @@ async def cancel_delete_handler(callback: CallbackQuery, state: FSMContext):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_ad_{message_id}"),
-            InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit_ad_{message_id}")
         ],
         [InlineKeyboardButton(text="👁 Посмотреть", url=message_url)],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_my_ads")]
@@ -1114,16 +985,31 @@ async def confirm_delete_handler(callback: CallbackQuery, state: FSMContext):
         logger.error(f"Ошибка при удалении объявления: {e}")
         await callback.answer("❌ Ошибка при удалении", show_alert=True)
 
-# ==================== БЛОКИРОВКА СООБЩЕНИЙ ИЗ ГРУППЫ ====================
-
-@dp.message()
-async def block_target_chat_messages(message: Message):
-    """Блокировка всех сообщений в группе объявлений"""
-    if message.chat.id == Config.TARGET_CHAT_ID:
-        return  # Игнорируем сообщения в группе объявлений
-    
-    # Все остальные сообщения обрабатываются нормально
-    pass
+@dp.callback_query(F.data == "back_to_my_ads")
+async def back_to_my_ads_handler(callback: CallbackQuery, state: FSMContext):
+    """Возврат к моим объявлениям"""
+    try:
+        user_id = callback.from_user.id
+        ads = await DatabaseService.get_user_ads(user_id)
+        user_limit = await get_user_limit(user_id)
+        
+        if not ads:
+            await callback.message.edit_text(
+                "🏠 Главное меню:",
+                reply_markup=KeyboardService.get_main_menu_keyboard()
+            )
+            await state.set_state(AdStates.main_menu)
+        else:
+            keyboard = await get_my_ads_keyboard(user_id)
+            await callback.message.edit_text(
+                f"📋 Ваши объявления ({len(ads)}/{user_limit}):",
+                reply_markup=keyboard
+            )
+            await state.set_state(AdStates.my_ads)
+        await callback.answer()
+    except Exception as e:
+        logger.warning(f"Ошибка при возврате к объявлениям: {e}")
+        await callback.answer()
 
 # ==================== КОМАНДЫ МОДЕРАЦИИ ====================
 
@@ -1146,51 +1032,6 @@ async def ban_command(message: Message):
         await DatabaseService.ban_user(user_id)
         await notify_user(user_id, "🚫 Вы были заблокированы администрацией.")
         await message.answer(f"✅ Пользователь {user_id} забанен")
-        
-    except ValueError:
-        await message.answer("❌ Неверный ID пользователя")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-
-@dp.message(Command("banall"))
-async def banall_command(message: Message):
-    """Команда бана и удаления всех сообщений пользователя"""
-    if message.chat.id == Config.TARGET_CHAT_ID:
-        return
-    
-    if not Config.MODERATION_CHAT_ID or message.chat.id != Config.MODERATION_CHAT_ID:
-        return
-    
-    try:
-        args = message.text.split()
-        if len(args) != 2:
-            await message.answer("❌ Использование: /banall <user_id>")
-            return
-        
-        user_id = int(args[1])
-        
-        # Получаем все объявления для удаления
-        ads = await DatabaseService.get_user_ads(user_id)
-        deleted_count = 0
-        
-        for message_id, _, _ in ads:
-            try:
-                await bot.delete_message(chat_id=Config.TARGET_CHAT_ID, message_id=message_id)
-                await DatabaseService.delete_user_ad(message_id)
-                deleted_count += 1
-            except Exception as e:
-                logger.warning(f"Не удалось удалить сообщение {message_id}: {e}")
-        
-        # Банем пользователя
-        await DatabaseService.ban_user(user_id)
-        
-        # Уведомляем пользователя
-        await notify_user(user_id, f"🚫 Вы были заблокированы администрацией. Все ваши объявления ({deleted_count} шт.) удалены.")
-        
-        await message.answer(
-            f"✅ Пользователь {user_id} забанен\n"
-            f"🗑 Удалено объявлений: {deleted_count}"
-        )
         
     except ValueError:
         await message.answer("❌ Неверный ID пользователя")
@@ -1272,57 +1113,6 @@ async def setlimit_command(message: Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
-@dp.message(Command("deladmin"))
-async def deladmin_command(message: Message):
-    """Команда удаления объявления администратором"""
-    if message.chat.id == Config.TARGET_CHAT_ID:
-        return
-    
-    if not Config.MODERATION_CHAT_ID or message.chat.id != Config.MODERATION_CHAT_ID:
-        return
-    
-    try:
-        args = message.text.split()
-        if len(args) != 2:
-            await message.answer("❌ Использование: /deladmin <message_id>")
-            return
-        
-        message_id = int(args[1])
-        ad_data = await DatabaseService.get_ad_by_message_id(message_id)
-        
-        if not ad_data:
-            await message.answer("❌ Объявление не найдено в базе данных")
-            return
-        
-        user_id, msg_id, message_url, topic_name = ad_data
-        
-        # Получаем информацию о пользователе для красивого названия
-        ads = await DatabaseService.get_user_ads_with_counts(user_id)
-        ad_display_name = "объявление"
-        for ad_msg_id, _, topic_display, _ in ads:
-            if ad_msg_id == message_id:
-                ad_display_name = f'"{topic_display}"'
-                break
-        
-        try:
-            # Удаляем сообщение из чата
-            await bot.delete_message(chat_id=Config.TARGET_CHAT_ID, message_id=message_id)
-        except Exception as e:
-            logger.warning(f"Не удалось удалить сообщение {message_id} из чата: {e}")
-        
-        # Удаляем из БД
-        await DatabaseService.delete_user_ad(message_id)
-        
-        # Уведомляем пользователя
-        await notify_user(user_id, f"🗑 Ваше объявление {ad_display_name} было удалено администрацией из-за нарушения правил.")
-        
-        await message.answer(f"✅ Объявление {message_id} удалено. Пользователь {user_id} уведомлен.")
-        
-    except ValueError:
-        await message.answer("❌ Неверный ID сообщения")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-
 @dp.message(Command("getlimit"))
 async def getlimit_command(message: Message):
     """Команда получения лимита объявлений"""
@@ -1353,130 +1143,42 @@ async def getlimit_command(message: Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
-# ==================== ДОПОЛНИТЕЛЬНЫЕ УТИЛИТЫ ====================
+# ==================== БЛОКИРОВКА СООБЩЕНИЙ ИЗ ГРУППЫ ====================
 
-async def edit_message_in_group(message_id: int, new_text: str, user_id: int, username: str = None) -> bool:
-    """Редактировать сообщение в группе"""
+@dp.message()
+async def block_target_chat_messages(message: Message):
+    """Блокировка всех сообщений в группе объявлений"""
+    if message.chat.id == Config.TARGET_CHAT_ID:
+        return  # Игнорируем сообщения в группе объявлений
+
+# ==================== АВТОПИНГ ====================
+
+async def ping_self():
+    """Автопинг для предотвращения засыпания"""
     try:
-        # Разбиваем на строки
-        lines = new_text.split('\n')
-        if lines:
-            # Первую строку в цитату
-            formatted_text = f"<blockquote>{lines[0]}</blockquote>"
-            # Остальные строки как есть
-            if len(lines) > 1:
-                formatted_text += "\n" + "\n".join(lines[1:])
-        else:
-            formatted_text = f"<blockquote>{new_text}</blockquote>"
-        
-        # Добавляем актуальную ссылку на автора
-        if username:
-            contact_url = f"https://t.me/{username}"
-        else:
-            contact_url = f"tg://user?id={user_id}"
-        
-        formatted_text += f'\n\n<a href="{contact_url}">—</a>'
-        
-        # Редактируем сообщение в группе
-        await bot.edit_message_text(
-            chat_id=Config.TARGET_CHAT_ID,
-            message_id=message_id,
-            text=formatted_text,
-            parse_mode="HTML"
-        )
-        
-        return True
-        
+        async with ClientSession() as session:
+            async with session.get(f"{Config.WEBHOOK_HOST}/health", timeout=10) as response:
+                if response.status == 200:
+                    logger.info("✅ Self ping successful")
+                else:
+                    logger.warning(f"⚠️ Self ping failed: {response.status}")
     except Exception as e:
-        logger.error(f"Ошибка редактирования сообщения: {e}")
-        return False
+        logger.warning(f"⚠️ Self ping error: {e}")
 
-async def send_edit_to_moderation(user_id: int, username: str, text: str, message_url: str, topic_name: str):
-    """Отправить уведомление об изменении в группу модерации"""
-    if not Config.MODERATION_CHAT_ID or Config.MODERATION_CHAT_ID == 0:
-        return
-    
-    try:
-        username_text = f"@{username}" if username else "Нет username"
-        message_id = message_url.split('/')[-1]
-        
-        moderation_text = (
-            f"✏️ Изменение объявления:\n\n"
-            f"👤 ID: {user_id}\n"
-            f"🔗 Username: {username_text}\n"
-            f"📂 Тема: {topic_name}\n"
-            f"🆔 ID сообщения: {message_id}\n\n"
-            f"📝 Новый текст:\n{text}\n\n"
-            f"🔗 Ссылка: {message_url}"
-        )
-        
-        await bot.send_message(
-            chat_id=Config.MODERATION_CHAT_ID,
-            text=moderation_text
-        )
-    except Exception as e:
-        logger.error(f"Ошибка отправки изменения в модерацию: {e}")
-
-async def set_user_limit(user_id: int, limit: int):
-    """Установить лимит объявлений для пользователя"""
-    try:
-        async with get_db_connection() as conn:
-            await conn.execute(
-                """INSERT INTO user_limits (user_id, ad_limit) 
-                   VALUES ($1, $2) 
-                   ON CONFLICT (user_id) 
-                   DO UPDATE SET ad_limit = $2, updated_at = CURRENT_TIMESTAMP""",
-                user_id, limit
-            )
-            # Инвалидируем кэш
-            await CacheService.delete(f"user_limit:{user_id}")
-    except Exception as e:
-        logger.error(f"Ошибка установки лимита: {e}")
-
-async def get_my_ads_keyboard(user_id: int):
-    """Клавиатура с объявлениями пользователя"""
-    ads = await DatabaseService.get_user_ads_with_counts(user_id)
-    buttons = []
-    
-    for message_id, message_url, topic_display, _ in ads:
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"📄 {topic_display}", 
-                callback_data=f"view_ad_{message_id}"
-            )
-        ])
-    
-    # Кнопка назад
-    buttons.append([
-        InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")
-    ])
-    
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+async def start_ping_task():
+    """Запуск задачи автопинга каждые 25 минут"""
+    while True:
+        await asyncio.sleep(1500)  # 25 минут
+        await ping_self()
 
 # ==================== ИНИЦИАЛИЗАЦИЯ ====================
-
-async def init_redis():
-    """Инициализация Redis"""
-    global redis_client
-    try:
-        redis_client = redis.from_url(Config.REDIS_URL, decode_responses=True)
-        await redis_client.ping()
-        logger.info("✅ Redis подключен")
-    except Exception as e:
-        logger.warning(f"⚠️ Redis недоступен: {e}")
-        # Fallback на память
-        redis_client = None
 
 async def init_bot():
     """Инициализация бота"""
     global bot, dp
     
-    # Инициализация Redis storage
-    if redis_client:
-        storage = RedisStorage(redis_client)
-    else:
-        from aiogram.fsm.storage.memory import MemoryStorage
-        storage = MemoryStorage()
+    # Memory storage для FSM
+    storage = MemoryStorage()
     
     bot = Bot(token=Config.BOT_TOKEN)
     dp = Dispatcher(storage=storage)
@@ -1505,25 +1207,7 @@ async def init_web_app():
             "bot_id": (await bot.get_me()).id if bot else None
         })
     
-    # Metrics endpoint
-    async def metrics(request):
-        try:
-            async with get_db_connection() as conn:
-                total_ads = await conn.fetchval("SELECT COUNT(*) FROM user_ads")
-                total_users = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM user_ads")
-                banned_users = await conn.fetchval("SELECT COUNT(*) FROM banned_users")
-            
-            return web.json_response({
-                "total_ads": total_ads,
-                "total_users": total_users,
-                "banned_users": banned_users,
-                "cache_status": "ok" if redis_client else "disabled"
-            })
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=500)
-    
     app.router.add_get('/health', health)
-    app.router.add_get('/metrics', metrics)
     
     # Настройка webhook
     webhook_requests_handler = SimpleRequestHandler(
@@ -1545,9 +1229,6 @@ async def cleanup():
         if db_pool:
             await db_pool.close()
         
-        if redis_client:
-            await redis_client.aclose()
-        
         logger.info("✅ Ресурсы очищены")
     except Exception as e:
         logger.error(f"❌ Ошибка очистки: {e}")
@@ -1557,12 +1238,11 @@ async def cleanup():
 async def main():
     """Главная функция приложения"""
     setup_logging()
-    logger.info("🚀 Запуск продакшн бота...")
+    logger.info("🚀 Запуск упрощенного продакшн бота...")
     
     try:
         # Инициализация компонентов
         await DatabaseService.init_database()
-        await init_redis()
         await init_bot()
         await init_web_app()
         
@@ -1573,6 +1253,11 @@ async def main():
         await site.start()
         
         logger.info(f"🌐 Сервер запущен на порту {Config.PORT}")
+        
+        # Запуск автопинга
+        asyncio.create_task(start_ping_task())
+        logger.info("🔄 Автопинг запущен (каждые 25 минут)")
+        
         logger.info("✅ Все сервисы успешно запущены")
         
         # Ожидание завершения
