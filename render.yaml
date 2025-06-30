@@ -1,6 +1,6 @@
 # ===========================================
-# Render.com Blueprint для автоматического деплоя
-# Создает все необходимые сервисы одной командой
+# Упрощенный Render.com Blueprint
+# Только PostgreSQL + Web Service
 # ===========================================
 
 services:
@@ -48,25 +48,14 @@ services:
         fromDatabase:
           name: telegram-bot-db
           property: connectionString
-          
-      - key: REDIS_URL
-        fromService:
-          type: redis
-          name: telegram-bot-redis
-          property: connectionString
     
     # Автодеплой из GitHub
     autoDeploy: true
     
-    # Кастомные домены (опционально)
-    # customDomains:
-    #   - name: bot.yourdomain.com
-    
-    # ==================== БАЗЫ ДАННЫХ ====================
+    # ==================== БАЗА ДАННЫХ ====================
   - type: pserv
     name: telegram-bot-db
     env: docker
-    dockerfilePath: ./Dockerfile.postgres  # Создается автоматически
     plan: free
     region: oregon
     
@@ -89,57 +78,4 @@ services:
     
     # Инициализация БД
     buildCommand: |
-      echo "Preparing PostgreSQL..."
-      # Скрипт инициализации выполнится автоматически
-    
-    # ==================== REDIS КЭШИРОВАНИЕ ====================
-  - type: redis
-    name: telegram-bot-redis
-    plan: free
-    region: oregon
-    maxmemoryPolicy: allkeys-lru
-    
-    # Конфигурация Redis
-    ipAllowList: []  # Доступ только для сервисов в том же аккаунте
-    
-# ==================== СТАТИЧЕСКИЕ ФАЙЛЫ ====================
-# Если нужны статические файлы (документация и т.д.)
-# - type: static
-#   name: bot-docs
-#   buildCommand: "echo 'Building docs...'"
-#   publishPath: ./docs
-#   pullRequestPreviewsEnabled: false
-
-# ==================== CRON ЗАДАЧИ ====================
-# Периодические задачи (очистка, статистика)
-- type: cron
-  name: daily-cleanup
-  schedule: "0 2 * * *"  # Каждый день в 2:00 UTC
-  dockerfilePath: ./Dockerfile.tasks
-  buildCommand: "echo 'Building cron tasks...'"
-  startCommand: "python -c 'import asyncio; from monitoring import cli_admin; asyncio.run(cli_admin(\"cleanup\"))'"
-  
-  envVars:
-    - key: DATABASE_URL
-      fromDatabase:
-        name: telegram-bot-db
-        property: connectionString
-        
-    - key: REDIS_URL
-      fromService:
-        type: redis
-        name: telegram-bot-redis
-        property: connectionString
-
-- type: cron
-  name: update-stats
-  schedule: "0 */6 * * *"  # Каждые 6 часов
-  dockerfilePath: ./Dockerfile.tasks
-  buildCommand: "echo 'Building stats update...'"
-  startCommand: "python -c 'import asyncio; from monitoring import cli_admin; asyncio.run(cli_admin(\"update-stats\"))'"
-  
-  envVars:
-    - key: DATABASE_URL
-      fromDatabase:
-        name: telegram-bot-db
-        property: connectionString
+      echo "PostgreSQL готов к работе"
