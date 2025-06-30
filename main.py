@@ -62,8 +62,8 @@ async def health_check(request):
 
 async def ping_self():
     """Автопинг для предотвращения засыпания"""
-    # ВАЖНО: После деплоя замените на ваш реальный URL
-    url = "https://six-o46c.onrender.com/health"  # Замените на ваш URL
+    # URL вашего приложения на Render
+    url = "https://six-o46c.onrender.com/health"
     try:
         async with ClientSession() as session:
             async with session.get(url) as response:
@@ -525,6 +525,27 @@ def get_post_actions_keyboard(user_id: int, message_url: str):
         ],
         [InlineKeyboardButton(text="📋 Мои объявления", callback_data="my_ads")]
     ])
+    return keyboard
+
+async def get_my_ads_keyboard(user_id: int):
+    """Клавиатура с объявлениями пользователя"""
+    ads = await get_user_ads_with_counts(user_id)
+    buttons = []
+    
+    for message_id, message_url, topic_display, _ in ads:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"📄 {topic_display}", 
+                callback_data=f"view_ad_{message_id}"
+            )
+        ])
+    
+    # Кнопка назад
+    buttons.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")
+    ])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     return keyboard
 
 @dp.message(Command("start"))
