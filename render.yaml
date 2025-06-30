@@ -1,6 +1,6 @@
 # ===========================================
 # Исправленный Render.com Blueprint
-# Совместимость с free tier
+# Только Web Service (PostgreSQL создается отдельно)
 # ===========================================
 
 services:
@@ -11,8 +11,6 @@ services:
     dockerfilePath: ./Dockerfile
     plan: free
     region: oregon
-    # buildCommand убираем для docker
-    # startCommand убираем для docker runtime
     healthCheckPath: /health
     
     # Переменные окружения
@@ -45,29 +43,25 @@ services:
         value: "8080"
         
       - key: DATABASE_URL
-        fromDatabase:
-          name: telegram-bot-db
-          property: connectionString
+        sync: false  # Устанавливается вручную после создания PostgreSQL
     
     # Автодеплой из GitHub
     autoDeploy: true
-    
-  # ==================== БАЗА ДАННЫХ ====================
-  - type: pserv
-    name: telegram-bot-db
-    plan: free
-    region: oregon
-    
-    # Переменные для PostgreSQL
-    envVars:
-      - key: POSTGRES_DB
-        value: telegram_bot
-        
-      - key: POSTGRES_USER
-        generateValue: true  # Автогенерация
-        
-      - key: POSTGRES_PASSWORD
-        generateValue: true  # Автогенерация
-    
-    # Убираем disk для free tier
-    # Free tier автоматически предоставляет storage
+
+# ===========================================
+# ИНСТРУКЦИЯ ПО СОЗДАНИЮ POSTGRESQL
+# ===========================================
+# 
+# PostgreSQL нужно создать отдельно через Render UI:
+# 
+# 1. Зайдите в Render Dashboard
+# 2. Нажмите "New +" → "PostgreSQL"
+# 3. Настройки:
+#    - Name: telegram-bot-db
+#    - Database Name: telegram_bot  
+#    - Plan: Free
+#    - Region: Oregon (US West)
+# 4. После создания скопируйте External Database URL
+# 5. Добавьте его в переменную DATABASE_URL веб-сервиса
+# 
+# ===========================================
