@@ -1,6 +1,6 @@
 # ===========================================
-# Упрощенный Render.com Blueprint
-# Только PostgreSQL + Web Service
+# Исправленный Render.com Blueprint
+# Совместимость с free tier
 # ===========================================
 
 services:
@@ -11,8 +11,8 @@ services:
     dockerfilePath: ./Dockerfile
     plan: free
     region: oregon
-    buildCommand: ""
-    startCommand: "python main.py"
+    # buildCommand убираем для docker
+    # startCommand убираем для docker runtime
     healthCheckPath: /health
     
     # Переменные окружения
@@ -52,10 +52,9 @@ services:
     # Автодеплой из GitHub
     autoDeploy: true
     
-    # ==================== БАЗА ДАННЫХ ====================
+  # ==================== БАЗА ДАННЫХ ====================
   - type: pserv
     name: telegram-bot-db
-    env: docker
     plan: free
     region: oregon
     
@@ -70,12 +69,5 @@ services:
       - key: POSTGRES_PASSWORD
         generateValue: true  # Автогенерация
     
-    # Persistent диск для данных
-    disk:
-      name: postgres-data
-      mountPath: /var/lib/postgresql/data
-      sizeGB: 1  # Бесплатный план
-    
-    # Инициализация БД
-    buildCommand: |
-      echo "PostgreSQL готов к работе"
+    # Убираем disk для free tier
+    # Free tier автоматически предоставляет storage
